@@ -82,6 +82,7 @@ void __wrap_abort(void);
 #include "./mweb/mweb_hash.c"
 #include "./mweb/mweb_kernel.c"
 #include "./mweb/mweb_keychain.c"
+#include "./mweb/mweb_output.c"
 #include "./mweb/mweb_scalar.c"
 #include "./mweb/mweb_schnorr.c"
 #include "./mweb/mweb_sign.c"
