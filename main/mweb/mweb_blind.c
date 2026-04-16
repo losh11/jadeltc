@@ -1,4 +1,5 @@
 #include "mweb_blind.h"
+#include "mweb_scalar.h"
 
 #include <string.h>
 
@@ -7,16 +8,6 @@
 #include <secp256k1_generator.h>
 #include <wally_core.h>
 #include <wally_crypto.h>
-
-/*
- * secp256k1 group order n (for overflow checks and raw scalar addition).
- */
-static const uint8_t SECP256K1_ORDER[32] = {
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
-    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
-    0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
-};
 
 /* Generator J for BlindSwitch (compressed pubkey, 33 bytes). */
 static const uint8_t GENERATOR_J[33] = {
