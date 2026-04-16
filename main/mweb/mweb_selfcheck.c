@@ -357,48 +357,42 @@ static bool test_mweb_sign_properties(void)
     uint8_t oid[32];
     mweb_hashed(MWEB_TAG_TAG, Ko, 33, oid);
 
-    /* Test 1: Signing with correct params succeeds */
-    mweb_sign_result_t result;
-    if (!mweb_sign_input(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 1000000,
-                         NULL, 0, kex, NULL, &result)) { FAIL(); }
+    /* Test 1: Stage A + Stage B with correct params succeed */
+    mweb_input_state_t state;
+    if (mweb_derive_input_state(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state) != MWEB_OK) { FAIL(); }
+
+    uint8_t signature[64];
+    if (mweb_sign_input_from_state(&state, NULL, 0, signature) != MWEB_OK) { FAIL(); }
 
     /* Commitment must have 0x08 or 0x09 prefix */
-    if (result.output_commit[0] != 0x08 && result.output_commit[0] != 0x09) { FAIL(); }
+    if (state.output_commit[0] != 0x08 && state.output_commit[0] != 0x09) { FAIL(); }
 
     /* Signature must be non-zero */
     uint8_t zero_sig[64] = {0};
-    if (memcmp(result.signature, zero_sig, 64) == 0) { FAIL(); }
+    if (memcmp(signature, zero_sig, 64) == 0) { FAIL(); }
 
     /* input_pubkey must be a valid 33-byte compressed pubkey */
-    if (result.input_pubkey[0] != 0x02 && result.input_pubkey[0] != 0x03) { FAIL(); }
+    if (state.input_pubkey[0] != 0x02 && state.input_pubkey[0] != 0x03) { FAIL(); }
 
-    /* Test 2: Wrong address_index must be rejected */
-    if (mweb_sign_input(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 1, /* wrong index */
-                        MWEB_INPUT_STEALTH_KEY_BIT,
-                        oid, Ko, 1000000,
-                        NULL, 0, kex, NULL, &result)) {
-        FAIL(); /* should have been rejected */
+    /* Test 2: Wrong address_index must be rejected at Stage A */
+    mweb_input_state_t state_wrong;
+    if (mweb_derive_input_state(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 1,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state_wrong) != MWEB_ERR_FOREIGN_MWEB_INPUT) {
+        FAIL();
     }
 
-    /* Test 3: Missing STEALTH_KEY_BIT must be rejected */
-    if (mweb_sign_input(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 0,
-                        0x00, /* no stealth bit */
-                        oid, Ko, 1000000,
-                        NULL, 0, kex, NULL, &result)) {
-        FAIL(); /* should have been rejected */
+    /* Test 3: Missing STEALTH_KEY_BIT must be rejected at Stage A */
+    mweb_input_state_t state_nobit;
+    if (mweb_derive_input_state(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 0,
+            0x00, /* no stealth bit */
+            oid, Ko, 1000000, kex, &state_nobit) != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+        FAIL();
     }
 
-    /* Test 4: Shared secret path must produce same commitment as kex path */
-    mweb_sign_result_t result_ss;
-    if (!mweb_sign_input(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 1000000,
-                         NULL, 0, NULL, ss, &result_ss)) { FAIL(); }
-
-    /* Both paths derive the same blind → same commitment */
-    if (memcmp(result.output_commit, result_ss.output_commit, 33) != 0) { FAIL(); }
+    (void)ss; /* retained for local scoping symmetry; bypass path is gone */
 
     return true;
 }

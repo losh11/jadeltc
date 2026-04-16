@@ -78,6 +78,7 @@ void __wrap_abort(void);
 #endif // ESP_PLATFORM
 #include "./main.c"
 #include "./multisig.c"
+#include "./mweb/mweb_atomic_sign.c"
 #include "./mweb/mweb_blind.c"
 #include "./mweb/mweb_hash.c"
 #include "./mweb/mweb_kernel.c"

@@ -28,8 +28,10 @@
 #include "sign_utils.h"
 
 #ifdef BUILD_MWEB
+#include "../mweb/mweb_atomic_sign.h"
 #include "../mweb/mweb_keychain.h"
 #include "../mweb/mweb_sign.h"
+#include "../utils/address.h"
 #endif
 
 // From https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
@@ -58,7 +60,8 @@ static const uint8_t PSET_MAGIC_PREFIX[5] = { 0x70, 0x73, 0x65, 0x74, 0xFF }; //
 #define MWEB_IN_INPUT_SIGNATURE         0x95
 #define MWEB_IN_ADDRESS_INDEX           0x96
 #define MWEB_IN_INPUT_AMOUNT            0x97
-#define MWEB_IN_SHARED_SECRET           0x98
+/* 0x98 (legacy shared-secret bypass) is deliberately omitted: Jade only
+ * accepts the 0x99 ECDH path. */
 #define MWEB_IN_KEY_EXCHANGE_PUBKEY     0x99
 #define MWEB_IN_MASTER_SCAN_KEY_ORIGIN  0x9A
 #define MWEB_IN_MASTER_SPEND_KEY_ORIGIN 0x9B
@@ -863,6 +866,15 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
     // Output info
     output_info_t* const output_info = JADE_CALLOC(psbt->num_outputs, sizeof(output_info_t));
 
+#ifdef BUILD_MWEB
+    // MWEB atomic signing session (bind-then-sign).
+    // - NULL outside an active pass.
+    // - Populated by mweb_session_begin() once inputs+outputs are counted.
+    // - Consumed by mweb_session_commit() after user approval; the cleanup
+    //   label calls mweb_session_abort() on any error path.
+    mweb_session_t* mweb_session = NULL;
+#endif
+
     // Go through each of the inputs summing amounts
     // Also, if we are signing this input, inspect the script type and any multisig info
     // For inputs we are signing, record the signature type
@@ -926,14 +938,14 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
                 continue; // Not our input — amount already counted above
             }
 
-            // Our input — validate presign required fields
+            // Our input — validate presign required fields.
+            // Only the 0x99 ECDH path is accepted; shared-secret is gone.
             if (!MWEB_HAS(input->mweb_keyset, MWEB_IN_SPENT_OUTPUT_PUBKEY)
                 || !MWEB_HAS(input->mweb_keyset, MWEB_IN_SPENT_OUTPUT_COMMIT)
                 || !MWEB_HAS(input->mweb_keyset, MWEB_IN_INPUT_FEATURES)
                 || !MWEB_HAS(input->mweb_keyset, MWEB_IN_ADDRESS_INDEX)
                 || !MWEB_HAS(input->mweb_keyset, MWEB_IN_INPUT_AMOUNT)
-                || (!MWEB_HAS(input->mweb_keyset, MWEB_IN_KEY_EXCHANGE_PUBKEY)
-                    && !MWEB_HAS(input->mweb_keyset, MWEB_IN_SHARED_SECRET))
+                || !MWEB_HAS(input->mweb_keyset, MWEB_IN_KEY_EXCHANGE_PUBKEY)
                 || !input->mweb_scan_key_origin.num_items
                 || !input->mweb_spend_key_origin.num_items) {
                 *errmsg = "Missing required MWEB input fields";
@@ -1188,6 +1200,38 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
             goto cleanup;
         }
 
+#ifdef BUILD_MWEB
+        // MWEB atomic pass: verify every MWEB output's recipient
+        // binding, check every input commit, validate the u64 balance,
+        // and sign the kernel in session memory. The PSBT is untouched
+        // until mweb_session_commit() runs after UI.
+        //
+        // The gate fires on any MWEB component so a standard→MWEB send
+        // (zero MWEB inputs, one MWEB output, one kernel) still enters
+        // the bind-then-sign pass.
+        {
+            bool has_mweb = mweb_input_count > 0 || psbt->num_mweb_kernels > 0;
+            if (!has_mweb) {
+                for (size_t i = 0; i < psbt->num_outputs; ++i) {
+                    if (MWEB_OUT_IS_MWEB(psbt->outputs[i].mweb_output_keyset)) {
+                        has_mweb = true;
+                        break;
+                    }
+                }
+            }
+            if (has_mweb) {
+                mweb_err_t merr = mweb_session_begin(psbt, network_id, &mweb_session);
+                if (merr != MWEB_OK) {
+                    *errmsg = mweb_err_to_string(merr);
+                    retval = (merr == MWEB_ERR_USER_CANCEL)
+                                 ? CBOR_RPC_USER_CANCELLED
+                                 : CBOR_RPC_BAD_PARAMETERS;
+                    goto cleanup;
+                }
+            }
+        }
+#endif /* BUILD_MWEB */
+
         if (!show_btc_transaction_outputs_activity(network_id, tx, output_info)) {
             *errmsg = "User declined to sign psbt";
             retval = CBOR_RPC_USER_CANCELLED;
@@ -1240,9 +1284,21 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
                     goto cleanup;
                 }
 
-                // Format amount and title
+                // Source the amount from the session value that passed
+                // recipient-binding verification, not from the raw PSBT
+                // or extracted-tx fields directly.
+                uint64_t mweb_out_satoshi = 0;
+                if (!mweb_session
+                    || mweb_session_get_output_value(mweb_session, i, &mweb_out_satoshi)
+                           != MWEB_OK) {
+                    *errmsg = "MWEB output not in verified session";
+                    retval = CBOR_RPC_INTERNAL_ERROR;
+                    goto cleanup;
+                }
+
                 char amount_str[32];
-                int ret = snprintf(amount_str, sizeof(amount_str), "%.08f", 1.0 * tx->outputs[i].satoshi / 1e8);
+                int ret = snprintf(amount_str, sizeof(amount_str),
+                    "%.08f", 1.0 * mweb_out_satoshi / 1e8);
                 JADE_ASSERT(ret > 0 && ret < sizeof(amount_str));
 
                 char title[32];
@@ -1256,6 +1312,75 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
                     goto cleanup;
                 }
             }
+
+            // Display every pegout entry in every kernel before any
+            // signature is emitted. Transparent recipients are carried
+            // in kernel.pegouts on an MWEB-input-bearing tx, so
+            // `psbt->outputs` can be empty on a pure MWEB→transparent
+            // spend — the user would see no destinations without this
+            // loop.
+            if (mweb_session) {
+                const size_t npeg = mweb_session_pegout_count(mweb_session);
+                for (size_t p = 0; p < npeg; ++p) {
+                    uint64_t peg_amount = 0;
+                    const uint8_t* peg_script = NULL;
+                    size_t peg_script_len = 0;
+                    if (mweb_session_get_pegout(mweb_session, p,
+                            &peg_amount, &peg_script, &peg_script_len, NULL) != MWEB_OK) {
+                        *errmsg = "Failed to read MWEB pegout entry";
+                        retval = CBOR_RPC_INTERNAL_ERROR;
+                        goto cleanup;
+                    }
+
+                    char peg_addr[MAX_ADDRESS_LEN];
+                    script_to_address(network_id, peg_script, peg_script_len,
+                        peg_amount > 0, peg_addr, sizeof(peg_addr));
+
+                    char peg_amount_str[32];
+                    int pret = snprintf(peg_amount_str, sizeof(peg_amount_str),
+                        "%.08f", 1.0 * peg_amount / 1e8);
+                    JADE_ASSERT(pret > 0 && pret < (int)sizeof(peg_amount_str));
+
+                    char peg_title[32];
+                    pret = snprintf(peg_title, sizeof(peg_title),
+                        "Pegout %lu/%lu",
+                        (unsigned long)(p + 1), (unsigned long)npeg);
+                    JADE_ASSERT(pret > 0 && pret < (int)sizeof(peg_title));
+
+                    if (!show_mweb_output_activity(peg_title, peg_addr,
+                            peg_amount_str, network_id)) {
+                        *errmsg = "User declined to sign psbt";
+                        retval = CBOR_RPC_USER_CANCELLED;
+                        goto cleanup;
+                    }
+                    mweb_session_mark_pegout_confirmed(mweb_session, p);
+                }
+            }
+
+            // Display every kernel pegin before any signature is
+            // emitted. A pegin contributes to the u64 balance equation
+            // (input side) and to the kernel signature hash; without
+            // explicit confirmation, a malicious host could pull
+            // transparent value into MWEB without the user approving
+            // it as a distinct destination-like action. Reuse the
+            // MWEB-output confirmation screen with a pegin-marked
+            // title until a dedicated pegin UI lands.
+            if (mweb_session && mweb_session_has_pegin(mweb_session)) {
+                const uint64_t pegin_amount =
+                    mweb_session_pegin_amount(mweb_session);
+                char pegin_amount_str[32];
+                int pret = snprintf(pegin_amount_str, sizeof(pegin_amount_str),
+                    "%.08f", 1.0 * pegin_amount / 1e8);
+                JADE_ASSERT(pret > 0 && pret < (int)sizeof(pegin_amount_str));
+
+                if (!show_mweb_output_activity("Pegin",
+                        "(transparent input)",
+                        pegin_amount_str, network_id)) {
+                    *errmsg = "User declined to sign psbt";
+                    retval = CBOR_RPC_USER_CANCELLED;
+                    goto cleanup;
+                }
+            }
         }
 #endif /* BUILD_MWEB */
 
@@ -1263,16 +1388,13 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
 
         // User to agree fee amount
 #ifdef BUILD_MWEB
-        // For MWEB: use kernel fees if available (authoritative for MWEB txns).
-        // Not gated on mweb_input_count — standard-to-MWEB sends still have kernels.
-        if (network_is_litecoin(network_id) && psbt->num_mweb_kernels > 0) {
-            uint64_t kernel_fee = 0;
-            for (size_t k = 0; k < psbt->num_mweb_kernels; ++k) {
-                if (psbt->mweb_kernels[k].has_fee) {
-                    kernel_fee += psbt->mweb_kernels[k].fee;
-                }
-            }
-            if (!show_btc_final_confirmation_activity(network_id, kernel_fee, NULL)) {
+        // For MWEB: display the fee that was hashed into the kernel
+        // signature. mweb_session_begin() verified kernel->has_fee and
+        // the feature bits are consistent with the balance equation, so
+        // this value is the authoritative source to render to the user.
+        if (mweb_session) {
+            const uint64_t verified_fee = mweb_session_total_fee(mweb_session);
+            if (!show_btc_final_confirmation_activity(network_id, verified_fee, NULL)) {
                 *errmsg = "User declined to sign psbt";
                 retval = CBOR_RPC_USER_CANCELLED;
                 goto cleanup;
@@ -1357,199 +1479,19 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
     }
 
 #ifdef BUILD_MWEB
-    // MWEB signing pass: sign all unsigned MWEB inputs whose fingerprint matches ours
-    if (mweb_input_count > 0) {
-        const secp256k1_context* secp_ctx = wally_get_secp_context();
-
-        // Load current offsets from PSBT globals (or zero)
-        uint8_t tx_offset[WALLY_TXHASH_LEN];
-        uint8_t stealth_offset[WALLY_TXHASH_LEN];
-        if (psbt->has_mweb_tx_offset) {
-            memcpy(tx_offset, psbt->mweb_tx_offset, WALLY_TXHASH_LEN);
-        } else {
-            memset(tx_offset, 0, WALLY_TXHASH_LEN);
+    // Commit the MWEB session. Emits every owned MWEB input's Schnorr
+    // signature (Stage B) and writes the kernel fields + offsets
+    // produced by mweb_session_begin() to the PSBT atomically. A
+    // failure rolls back the PSBT to its pre-begin state so partial
+    // signatures never escape.
+    if (mweb_session) {
+        mweb_err_t cerr = mweb_session_commit(mweb_session, psbt);
+        mweb_session = NULL; /* consumed by commit/abort */
+        if (cerr != MWEB_OK) {
+            *errmsg = mweb_err_to_string(cerr);
+            retval = CBOR_RPC_INTERNAL_ERROR;
+            goto cleanup;
         }
-        if (psbt->has_mweb_stealth_offset) {
-            memcpy(stealth_offset, psbt->mweb_stealth_offset, WALLY_TXHASH_LEN);
-        } else {
-            memset(stealth_offset, 0, WALLY_TXHASH_LEN);
-        }
-
-        uint8_t wallet_fp[BIP32_KEY_FINGERPRINT_LEN];
-        wallet_get_fingerprint(wallet_fp, sizeof(wallet_fp));
-        // Reverse to LE
-        uint8_t wallet_fp_le[BIP32_KEY_FINGERPRINT_LEN];
-        wallet_fp_le[0] = wallet_fp[3];
-        wallet_fp_le[1] = wallet_fp[2];
-        wallet_fp_le[2] = wallet_fp[1];
-        wallet_fp_le[3] = wallet_fp[0];
-
-        for (size_t index = 0; index < psbt->num_inputs; ++index) {
-            struct wally_psbt_input* input = &psbt->inputs[index];
-            if (!MWEB_IN_HAS_OUTPUT_ID(input->mweb_keyset)) {
-                continue; // Not an MWEB input
-            }
-            if (MWEB_HAS(input->mweb_keyset, MWEB_IN_INPUT_SIGNATURE)) {
-                continue; // Already signed
-            }
-
-            // Fingerprint check (both scan and spend key origins)
-            uint8_t scan_fp[BIP32_KEY_FINGERPRINT_LEN];
-            if (wally_map_keypath_get_item_fingerprint(
-                    &input->mweb_scan_key_origin, 0, scan_fp, sizeof(scan_fp)) != WALLY_OK) {
-                continue;
-            }
-            uint8_t spend_fp[BIP32_KEY_FINGERPRINT_LEN];
-            if (wally_map_keypath_get_item_fingerprint(
-                    &input->mweb_spend_key_origin, 0, spend_fp, sizeof(spend_fp)) != WALLY_OK) {
-                continue;
-            }
-            if (memcmp(scan_fp, wallet_fp_le, BIP32_KEY_FINGERPRINT_LEN) != 0
-                || memcmp(spend_fp, wallet_fp_le, BIP32_KEY_FINGERPRINT_LEN) != 0) {
-                continue; // Not our input
-            }
-
-            JADE_LOGD("Signing MWEB input %u", index);
-
-            // Derive scan key from path in 0x9A
-            uint32_t scan_path[MAX_PATH_LEN];
-            size_t scan_path_len = 0;
-            if (wally_map_keypath_get_item_path(&input->mweb_scan_key_origin, 0,
-                    scan_path, MAX_PATH_LEN, &scan_path_len) != WALLY_OK
-                || scan_path_len == 0) {
-                *errmsg = "Failed to read MWEB scan key path";
-                retval = CBOR_RPC_INTERNAL_ERROR;
-                goto cleanup;
-            }
-
-            uint8_t scan_key[32];
-            SENSITIVE_PUSH(scan_key, sizeof(scan_key));
-            if (!mweb_derive_key_from_path(scan_path, scan_path_len, scan_key)) {
-                SENSITIVE_POP(scan_key);
-                *errmsg = "Failed to derive MWEB scan key";
-                retval = CBOR_RPC_INTERNAL_ERROR;
-                goto cleanup;
-            }
-
-            // Verify derived scan pubkey matches the key data in 0x9A
-            uint8_t scan_pub[EC_PUBLIC_KEY_LEN];
-            if (wally_ec_public_key_from_private_key(scan_key, 32, scan_pub, sizeof(scan_pub)) != WALLY_OK
-                || input->mweb_scan_key_origin.items[0].key_len < EC_PUBLIC_KEY_LEN
-                || memcmp(scan_pub, input->mweb_scan_key_origin.items[0].key, EC_PUBLIC_KEY_LEN) != 0) {
-                SENSITIVE_POP(scan_key);
-                *errmsg = "MWEB scan key mismatch";
-                retval = CBOR_RPC_BAD_PARAMETERS;
-                goto cleanup;
-            }
-
-            // Derive spend key from path in 0x9B
-            uint32_t spend_path[MAX_PATH_LEN];
-            size_t spend_path_len = 0;
-            if (wally_map_keypath_get_item_path(&input->mweb_spend_key_origin, 0,
-                    spend_path, MAX_PATH_LEN, &spend_path_len) != WALLY_OK
-                || spend_path_len == 0) {
-                SENSITIVE_POP(scan_key);
-                *errmsg = "Failed to read MWEB spend key path";
-                retval = CBOR_RPC_INTERNAL_ERROR;
-                goto cleanup;
-            }
-
-            uint8_t spend_key[32];
-            SENSITIVE_PUSH(spend_key, sizeof(spend_key));
-            if (!mweb_derive_key_from_path(spend_path, spend_path_len, spend_key)) {
-                SENSITIVE_POP(spend_key);
-                SENSITIVE_POP(scan_key);
-                *errmsg = "Failed to derive MWEB spend key";
-                retval = CBOR_RPC_INTERNAL_ERROR;
-                goto cleanup;
-            }
-
-            // Verify derived spend pubkey matches the key data in 0x9B
-            uint8_t spend_pub[EC_PUBLIC_KEY_LEN];
-            if (wally_ec_public_key_from_private_key(spend_key, 32, spend_pub, sizeof(spend_pub)) != WALLY_OK
-                || input->mweb_spend_key_origin.items[0].key_len < EC_PUBLIC_KEY_LEN
-                || memcmp(spend_pub, input->mweb_spend_key_origin.items[0].key, EC_PUBLIC_KEY_LEN) != 0) {
-                SENSITIVE_POP(spend_key);
-                SENSITIVE_POP(scan_key);
-                *errmsg = "MWEB spend key mismatch";
-                retval = CBOR_RPC_BAD_PARAMETERS;
-                goto cleanup;
-            }
-
-            // Determine shared_secret source
-            const uint8_t* kex_pk = MWEB_HAS(input->mweb_keyset, MWEB_IN_KEY_EXCHANGE_PUBKEY)
-                ? input->mweb_key_exchange_pubkey
-                : NULL;
-            const uint8_t* ss = MWEB_HAS(input->mweb_keyset, MWEB_IN_SHARED_SECRET)
-                ? input->mweb_shared_secret
-                : NULL;
-
-            // Sign the MWEB input
-            mweb_sign_result_t result;
-            if (!mweb_sign_input(scan_key, spend_key,
-                    input->mweb_address_index,
-                    input->mweb_input_features,
-                    input->mweb_spent_output_id,
-                    input->mweb_spent_output_pubkey,
-                    input->mweb_input_amount,
-                    input->mweb_extra_data, input->mweb_extra_data_len,
-                    kex_pk, ss, &result)) {
-                SENSITIVE_POP(spend_key);
-                SENSITIVE_POP(scan_key);
-                *errmsg = "MWEB input signing failed";
-                retval = CBOR_RPC_INTERNAL_ERROR;
-                goto cleanup;
-            }
-
-            SENSITIVE_POP(spend_key);
-            SENSITIVE_POP(scan_key);
-
-            // Write results to input struct
-            memcpy(input->mweb_input_signature, result.signature, EC_SIGNATURE_LEN);
-            memcpy(input->mweb_input_pubkey, result.input_pubkey, EC_PUBLIC_KEY_LEN);
-            memcpy(input->mweb_spent_output_commit, result.output_commit, EC_PUBLIC_KEY_LEN);
-            input->mweb_keyset |= (1u << (MWEB_IN_INPUT_SIGNATURE - MWEB_IN_MIN));
-            input->mweb_keyset |= (1u << (MWEB_IN_INPUT_PUBKEY - MWEB_IN_MIN));
-            input->mweb_keyset |= (1u << (MWEB_IN_SPENT_OUTPUT_COMMIT - MWEB_IN_MIN));
-
-            // Update global offsets (scalar arithmetic mod n).
-            // secp256k1_ec_seckey_tweak_add rejects a zero seckey, so when the
-            // offset is still all-zeros we assign the tweak value directly.
-            {
-                static const uint8_t zero32[32] = { 0 };
-
-                // tx_offset -= result.input_blind
-                uint8_t neg_blind[32];
-                memcpy(neg_blind, result.input_blind, 32);
-                if (!secp256k1_ec_seckey_negate(secp_ctx, neg_blind)) {
-                    memset(neg_blind, 0, 32);
-                }
-                if (memcmp(tx_offset, zero32, 32) == 0) {
-                    memcpy(tx_offset, neg_blind, 32);
-                } else if (!secp256k1_ec_seckey_tweak_add(secp_ctx, tx_offset, neg_blind)) {
-                    memset(tx_offset, 0, 32);
-                }
-                wally_bzero(neg_blind, sizeof(neg_blind));
-
-                // stealth_offset += result.stealth_tweak
-                if (memcmp(stealth_offset, zero32, 32) == 0) {
-                    memcpy(stealth_offset, result.stealth_tweak, 32);
-                } else if (!secp256k1_ec_seckey_tweak_add(secp_ctx, stealth_offset, result.stealth_tweak)) {
-                    memset(stealth_offset, 0, 32);
-                }
-            }
-
-            wally_bzero(&result, sizeof(result));
-        }
-
-        // Write updated offsets back to PSBT globals
-        memcpy(psbt->mweb_tx_offset, tx_offset, WALLY_TXHASH_LEN);
-        psbt->has_mweb_tx_offset = 1;
-        memcpy(psbt->mweb_stealth_offset, stealth_offset, WALLY_TXHASH_LEN);
-        psbt->has_mweb_stealth_offset = 1;
-
-        wally_bzero(tx_offset, sizeof(tx_offset));
-        wally_bzero(stealth_offset, sizeof(stealth_offset));
     }
 #endif /* BUILD_MWEB */
 
@@ -1557,6 +1499,12 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
     JADE_ASSERT(!retval);
 
 cleanup:
+#ifdef BUILD_MWEB
+    if (mweb_session) {
+        mweb_session_abort(mweb_session, psbt);
+        mweb_session = NULL;
+    }
+#endif
     SENSITIVE_POP(&iter);
     free(descriptor);
     free(multisig_data);

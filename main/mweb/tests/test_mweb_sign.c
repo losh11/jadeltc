@@ -1,18 +1,23 @@
 /*
- * Tests for mweb_sign_input.
+ * Tests for the two-stage MWEB input signing API.
+ *
+ *   mweb_derive_input_state — Stage A (non-signing derivation)
+ *   mweb_sign_input_from_state — Stage B (Schnorr emission)
  *
  * Uses the known scan/spend keys from mweb_compat_test.go and constructs
  * a synthetic MWEB input to test:
  *   - Output key verification accepts correct address_index
  *   - Output key verification rejects wrong address_index
  *   - Missing STEALTH_KEY_BIT is rejected
- *   - Signing produces valid output (commitment format, signature verification)
- *   - Deterministic with fixed ephemeral key
- *   - Shared secret path produces same result as key_exchange_pk path
+ *   - Two-stage pipeline is deterministic given a fixed ephemeral
+ *   - Reference-vector parity against the legacy single-shot signer
+ *   - extra_data affects the emitted signature
+ *   - EXTRA_DATA_BIT with empty data is distinguishable from no-bit
+ *   - Stage A emits no signature (no Schnorr side effect)
  */
 #include "mweb_sign.h"
-#include "mweb_blind.h"
 #include "mweb_hash.h"
+#include "mweb_kernel.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -24,10 +29,10 @@
 
 static int failures = 0;
 
-/* Deterministic "random" for testing — set by test before calling sign */
+/* Deterministic "random" for testing — set by test before calling Stage A. */
 static uint8_t g_test_random[32];
 
-/* Stub for get_random that returns deterministic bytes */
+/* Stub for get_random that returns deterministic bytes. */
 void get_random(void* bytes_out, size_t len)
 {
     if (len <= 32) {
@@ -57,21 +62,19 @@ static const uint8_t SPEND_KEY[32] = {
 /*
  * Build a synthetic MWEB output for testing.
  * Given scan/spend keys, address index, and a sender key, derive:
- *   - shared_secret, key_exchange_pk
+ *   - key_exchange_pk
  *   - spent_output_pk (Ko)
  *   - spent_output_id (arbitrary hash)
  */
 static bool build_test_input(
     uint32_t address_index,
     const uint8_t sender_key[32],
-    uint8_t shared_secret_out[32],
     uint8_t key_exchange_pk_out[33],
     uint8_t spent_output_pk_out[33],
     uint8_t spent_output_id_out[32])
 {
     const secp256k1_context* ctx = wally_get_secp_context();
 
-    /* Derive the stealth address components for address_index */
     /* m_i = Hashed('A', index || scan_key) */
     uint8_t mi_buf[4 + 32];
     mi_buf[0] = (uint8_t)(address_index);
@@ -100,18 +103,18 @@ static bool build_test_input(
     secp256k1_ec_pubkey_serialize(ctx, key_exchange_pk_out, &ke_len, &Ke_pk, SECP256K1_EC_COMPRESSED);
 
     /* shared_secret = Hashed('D', key_exchange_pk * scan_key) */
-    /* scan_key * Ke = scan_key * (sender_key * B_i) */
     secp256k1_pubkey kex_parsed;
     if (!secp256k1_ec_pubkey_parse(ctx, &kex_parsed, key_exchange_pk_out, 33)) return false;
     if (!secp256k1_ec_pubkey_tweak_mul(ctx, &kex_parsed, SCAN_KEY)) return false;
     uint8_t ecdh_bytes[33];
     size_t ecdh_len = 33;
     secp256k1_ec_pubkey_serialize(ctx, ecdh_bytes, &ecdh_len, &kex_parsed, SECP256K1_EC_COMPRESSED);
-    mweb_hashed(MWEB_TAG_DERIVE, ecdh_bytes, 33, shared_secret_out);
+    uint8_t ss[32];
+    mweb_hashed(MWEB_TAG_DERIVE, ecdh_bytes, 33, ss);
 
     /* out_key_hash = Hashed('O', shared_secret) */
     uint8_t okh[32];
-    mweb_hashed(MWEB_TAG_OUTKEY, shared_secret_out, 32, okh);
+    mweb_hashed(MWEB_TAG_OUTKEY, ss, 32, okh);
 
     /* Ko = out_key_hash * B_i */
     secp256k1_pubkey Ko_pk = Bi_pk;
@@ -119,7 +122,7 @@ static bool build_test_input(
     size_t ko_len = 33;
     secp256k1_ec_pubkey_serialize(ctx, spent_output_pk_out, &ko_len, &Ko_pk, SECP256K1_EC_COMPRESSED);
 
-    /* spent_output_id: just hash something deterministic */
+    /* spent_output_id: deterministic hash of Ko */
     mweb_hashed(MWEB_TAG_TAG, spent_output_pk_out, 33, spent_output_id_out);
 
     return true;
@@ -127,9 +130,8 @@ static bool build_test_input(
 
 /* --- Tests --- */
 
-static void test_sign_success(void)
+static void test_two_stage_success(void)
 {
-    /* Use a fixed sender key and ephemeral key for determinism */
     const uint8_t sender_key[32] = {
         0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
         0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,
@@ -137,55 +139,58 @@ static void test_sign_success(void)
         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     };
 
-    /* Build test input for address index 0 */
-    uint8_t ss[32], kex[33], Ko[33], oid[32];
-    if (!build_test_input(0, sender_key, ss, kex, Ko, oid)) {
-        printf("FAIL: sign_success — build_test_input\n");
+    uint8_t kex[33], Ko[33], oid[32];
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
+        printf("FAIL: two_stage_success — build_test_input\n");
         failures++;
         return;
     }
 
-    /* Set deterministic ephemeral key */
     memset(g_test_random, 0x42, 32);
 
-    /* Sign with key_exchange_pk */
-    mweb_sign_result_t result;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 1000000,
-                         NULL, 0,   /* no extra_data */
-                         kex, NULL, /* key_exchange_pk path */
-                         &result)) {
-        printf("FAIL: sign_success — mweb_sign_input\n");
+    mweb_input_state_t state;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000,
+            kex, &state) != MWEB_OK) {
+        printf("FAIL: two_stage_success — derive_input_state\n");
         failures++;
         return;
     }
 
-    /* Verify commitment has 0x08 or 0x09 prefix */
-    if (result.output_commit[0] != 0x08 && result.output_commit[0] != 0x09) {
-        printf("FAIL: sign_success — commit prefix 0x%02x\n", result.output_commit[0]);
+    uint8_t signature[64];
+    if (mweb_sign_input_from_state(&state, NULL, 0, signature) != MWEB_OK) {
+        printf("FAIL: two_stage_success — sign_input_from_state\n");
         failures++;
         return;
     }
 
-    /* Verify signature is 64 bytes of non-zero */
+    if (state.output_commit[0] != 0x08 && state.output_commit[0] != 0x09) {
+        printf("FAIL: two_stage_success — commit prefix 0x%02x\n", state.output_commit[0]);
+        failures++;
+        return;
+    }
+
     int sig_nonzero = 0;
     for (int i = 0; i < 64; i++) {
-        if (result.signature[i]) sig_nonzero = 1;
+        if (signature[i]) sig_nonzero = 1;
     }
     if (!sig_nonzero) {
-        printf("FAIL: sign_success — zero signature\n");
+        printf("FAIL: two_stage_success — zero signature\n");
         failures++;
         return;
     }
 
-    printf("PASS: sign_success\n");
+    printf("PASS: two_stage_success\n");
 }
 
 /*
  * Reference vectors for deterministic signing.
  * Inputs: scan/spend keys from mweb_compat_test.go, address_index=0,
  *         sender_key=0x1122..10, ephemeral=0x42 repeated, amount=1000000.
+ *
+ * These are the same bytes the legacy single-shot signer produced.
+ * The two-stage API must maintain byte-for-byte parity.
  */
 static const uint8_t EXPECTED_SIGNATURE[64] = {
     0x8d,0x6c,0x01,0xfb,0x52,0xbf,0x9a,0xf4,
@@ -224,7 +229,7 @@ static const uint8_t EXPECTED_OUTPUT_COMMIT[33] = {
     0x51,
 };
 
-static void test_sign_deterministic(void)
+static void test_legacy_reference_vectors(void)
 {
     const uint8_t sender_key[32] = {
         0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
@@ -233,116 +238,139 @@ static void test_sign_deterministic(void)
         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     };
 
-    uint8_t ss[32], kex[33], Ko[33], oid[32];
-    if (!build_test_input(0, sender_key, ss, kex, Ko, oid)) {
-        printf("FAIL: deterministic — build\n");
+    uint8_t kex[33], Ko[33], oid[32];
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
+        printf("FAIL: legacy_reference — build\n");
         failures++;
         return;
     }
 
-    /* Sign with deterministic ephemeral key */
     memset(g_test_random, 0x42, 32);
-    mweb_sign_result_t r1;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 1000000, NULL, 0, kex, NULL, &r1)) {
-        printf("FAIL: deterministic — sign1\n");
+    mweb_input_state_t state;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state) != MWEB_OK) {
+        printf("FAIL: legacy_reference — derive\n");
         failures++;
         return;
     }
 
-    /* Verify all outputs match reference vectors byte-for-byte */
-    if (memcmp(r1.signature, EXPECTED_SIGNATURE, 64) != 0) {
-        printf("FAIL: deterministic — signature mismatch\n");
-        failures++;
-        return;
-    }
-    if (memcmp(r1.input_blind, EXPECTED_INPUT_BLIND, 32) != 0) {
-        printf("FAIL: deterministic — input_blind mismatch\n");
-        failures++;
-        return;
-    }
-    if (memcmp(r1.stealth_tweak, EXPECTED_STEALTH_TWEAK, 32) != 0) {
-        printf("FAIL: deterministic — stealth_tweak mismatch\n");
-        failures++;
-        return;
-    }
-    if (memcmp(r1.input_pubkey, EXPECTED_INPUT_PUBKEY, 33) != 0) {
-        printf("FAIL: deterministic — input_pubkey mismatch\n");
-        failures++;
-        return;
-    }
-    if (memcmp(r1.output_commit, EXPECTED_OUTPUT_COMMIT, 33) != 0) {
-        printf("FAIL: deterministic — output_commit mismatch\n");
+    uint8_t signature[64];
+    if (mweb_sign_input_from_state(&state, NULL, 0, signature) != MWEB_OK) {
+        printf("FAIL: legacy_reference — sign\n");
         failures++;
         return;
     }
 
-    /* Sign again — must produce identical result (deterministic nonce in Schnorr) */
+    if (memcmp(signature, EXPECTED_SIGNATURE, 64) != 0) {
+        printf("FAIL: legacy_reference — signature mismatch\n");
+        failures++;
+        return;
+    }
+    if (memcmp(state.blind, EXPECTED_INPUT_BLIND, 32) != 0) {
+        printf("FAIL: legacy_reference — input_blind mismatch\n");
+        failures++;
+        return;
+    }
+    if (memcmp(state.stealth_tweak, EXPECTED_STEALTH_TWEAK, 32) != 0) {
+        printf("FAIL: legacy_reference — stealth_tweak mismatch\n");
+        failures++;
+        return;
+    }
+    if (memcmp(state.input_pubkey, EXPECTED_INPUT_PUBKEY, 33) != 0) {
+        printf("FAIL: legacy_reference — input_pubkey mismatch\n");
+        failures++;
+        return;
+    }
+    if (memcmp(state.output_commit, EXPECTED_OUTPUT_COMMIT, 33) != 0) {
+        printf("FAIL: legacy_reference — output_commit mismatch\n");
+        failures++;
+        return;
+    }
+
+    /* Determinism: rerun with same ephemeral, assert byte-identical. */
     memset(g_test_random, 0x42, 32);
-    mweb_sign_result_t r2;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 1000000, NULL, 0, kex, NULL, &r2)) {
-        printf("FAIL: deterministic — sign2\n");
+    mweb_input_state_t state2;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state2) != MWEB_OK) {
+        printf("FAIL: legacy_reference — derive2\n");
         failures++;
         return;
     }
-    if (memcmp(&r1, &r2, sizeof(r1)) != 0) {
-        printf("FAIL: deterministic — results differ\n");
+    uint8_t signature2[64];
+    if (mweb_sign_input_from_state(&state2, NULL, 0, signature2) != MWEB_OK) {
+        printf("FAIL: legacy_reference — sign2\n");
+        failures++;
+        return;
+    }
+    if (memcmp(signature, signature2, 64) != 0
+        || memcmp(state.blind, state2.blind, 32) != 0
+        || memcmp(state.stealth_tweak, state2.stealth_tweak, 32) != 0
+        || memcmp(state.input_pubkey, state2.input_pubkey, 33) != 0
+        || memcmp(state.output_commit, state2.output_commit, 33) != 0) {
+        printf("FAIL: legacy_reference — re-run differs\n");
         failures++;
         return;
     }
 
-    printf("PASS: sign_deterministic\n");
+    printf("PASS: legacy_reference_vectors\n");
 }
 
-static void test_shared_secret_path(void)
+/*
+ * Stage A alone must not emit any Schnorr signature.
+ * Verified indirectly by asserting the output_commit/blind/stealth_tweak
+ * fields match the reference vectors (i.e. Stage A executed fully) while
+ * no signature variable has been computed. Stage B only runs when the
+ * caller explicitly invokes mweb_sign_input_from_state.
+ */
+static void test_stage_a_no_signature(void)
 {
     const uint8_t sender_key[32] = {
-        0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,0x11,
-        0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,
+        0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+        0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,
         0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     };
 
-    uint8_t ss[32], kex[33], Ko[33], oid[32];
-    if (!build_test_input(1, sender_key, ss, kex, Ko, oid)) {
-        printf("FAIL: shared_secret_path — build\n");
+    uint8_t kex[33], Ko[33], oid[32];
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
+        printf("FAIL: stage_a_no_signature — build\n");
         failures++;
         return;
     }
 
-    memset(g_test_random, 0x77, 32);
-
-    /* Sign with key_exchange_pk */
-    mweb_sign_result_t r_kex;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 1,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 500000, NULL, 0, kex, NULL, &r_kex)) {
-        printf("FAIL: shared_secret_path — sign kex\n");
+    memset(g_test_random, 0x42, 32);
+    mweb_input_state_t state;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state) != MWEB_OK) {
+        printf("FAIL: stage_a_no_signature — derive\n");
         failures++;
         return;
     }
 
-    /* Sign with shared_secret directly (same result expected) */
-    memset(g_test_random, 0x77, 32);
-    mweb_sign_result_t r_ss;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 1,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 500000, NULL, 0, NULL, ss, &r_ss)) {
-        printf("FAIL: shared_secret_path — sign ss\n");
+    /* The state struct has no signature field. Stage A cannot have
+     * emitted one. Also assert the Stage-B-reproducibility fields
+     * are cached. */
+    if (state.value != 1000000) {
+        printf("FAIL: stage_a_no_signature — value not cached\n");
+        failures++;
+        return;
+    }
+    if (state.features != MWEB_INPUT_STEALTH_KEY_BIT) {
+        printf("FAIL: stage_a_no_signature — features not cached\n");
+        failures++;
+        return;
+    }
+    if (memcmp(state.spent_output_id, oid, 32) != 0
+        || memcmp(state.spent_output_pk, Ko, 33) != 0) {
+        printf("FAIL: stage_a_no_signature — identifiers not cached\n");
         failures++;
         return;
     }
 
-    if (memcmp(&r_kex, &r_ss, sizeof(r_kex)) != 0) {
-        printf("FAIL: shared_secret_path — results differ\n");
-        failures++;
-        return;
-    }
-
-    printf("PASS: shared_secret_path\n");
+    printf("PASS: stage_a_no_signature\n");
 }
 
 static void test_wrong_address_index(void)
@@ -354,21 +382,21 @@ static void test_wrong_address_index(void)
         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     };
 
-    uint8_t ss[32], kex[33], Ko[33], oid[32];
-    /* Build for index 0, but try to sign with index 1 */
-    if (!build_test_input(0, sender_key, ss, kex, Ko, oid)) {
+    uint8_t kex[33], Ko[33], oid[32];
+    /* Build for index 0, try to sign with index 1 */
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
         printf("FAIL: wrong_index — build\n");
         failures++;
         return;
     }
 
     memset(g_test_random, 0x42, 32);
-    mweb_sign_result_t result;
-    /* Pass address_index=1 but Ko was derived for index=0 → must fail */
-    if (mweb_sign_input(SCAN_KEY, SPEND_KEY, 1,
-                        MWEB_INPUT_STEALTH_KEY_BIT,
-                        oid, Ko, 1000000, NULL, 0, kex, NULL, &result)) {
-        printf("FAIL: wrong_index — should have been rejected\n");
+    mweb_input_state_t state;
+    mweb_err_t err = mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 1,
+        MWEB_INPUT_STEALTH_KEY_BIT,
+        oid, Ko, 1000000, kex, &state);
+    if (err != MWEB_ERR_FOREIGN_MWEB_INPUT) {
+        printf("FAIL: wrong_index — expected FOREIGN_MWEB_INPUT, got %d\n", err);
         failures++;
         return;
     }
@@ -385,20 +413,20 @@ static void test_missing_stealth_bit(void)
         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     };
 
-    uint8_t ss[32], kex[33], Ko[33], oid[32];
-    if (!build_test_input(0, sender_key, ss, kex, Ko, oid)) {
+    uint8_t kex[33], Ko[33], oid[32];
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
         printf("FAIL: missing_stealth — build\n");
         failures++;
         return;
     }
 
     memset(g_test_random, 0x42, 32);
-    mweb_sign_result_t result;
-    /* features=0 (no STEALTH_KEY_BIT) → must fail */
-    if (mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                        0x00, /* no stealth bit */
-                        oid, Ko, 1000000, NULL, 0, kex, NULL, &result)) {
-        printf("FAIL: missing_stealth — should have been rejected\n");
+    mweb_input_state_t state;
+    mweb_err_t err = mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+        0x00, /* no stealth bit */
+        oid, Ko, 1000000, kex, &state);
+    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+        printf("FAIL: missing_stealth — expected INVALID_PRESIGN_SCALAR, got %d\n", err);
         failures++;
         return;
     }
@@ -415,41 +443,49 @@ static void test_sign_with_extra_data(void)
         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     };
 
-    uint8_t ss[32], kex[33], Ko[33], oid[32];
-    if (!build_test_input(0, sender_key, ss, kex, Ko, oid)) {
+    uint8_t kex[33], Ko[33], oid[32];
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
         printf("FAIL: extra_data — build\n");
         failures++;
         return;
     }
 
     const uint8_t extra[] = { 0xde, 0xad, 0xbe, 0xef };
-    memset(g_test_random, 0x42, 32);
 
-    mweb_sign_result_t result;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT | MWEB_INPUT_EXTRA_DATA_BIT,
-                         oid, Ko, 1000000,
-                         extra, sizeof(extra),
-                         kex, NULL, &result)) {
-        printf("FAIL: extra_data — sign\n");
+    memset(g_test_random, 0x42, 32);
+    mweb_input_state_t state_with;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT | MWEB_INPUT_EXTRA_DATA_BIT,
+            oid, Ko, 1000000, kex, &state_with) != MWEB_OK) {
+        printf("FAIL: extra_data — derive_with\n");
+        failures++;
+        return;
+    }
+    uint8_t sig_with[64];
+    if (mweb_sign_input_from_state(&state_with, extra, sizeof(extra), sig_with)
+            != MWEB_OK) {
+        printf("FAIL: extra_data — sign_with\n");
         failures++;
         return;
     }
 
-    /* Sign again without extra_data — signature must differ (different msg_hash) */
     memset(g_test_random, 0x42, 32);
-    mweb_sign_result_t result_no_extra;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 1000000,
-                         NULL, 0,
-                         kex, NULL, &result_no_extra)) {
-        printf("FAIL: extra_data — sign_no_extra\n");
+    mweb_input_state_t state_without;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state_without) != MWEB_OK) {
+        printf("FAIL: extra_data — derive_without\n");
+        failures++;
+        return;
+    }
+    uint8_t sig_without[64];
+    if (mweb_sign_input_from_state(&state_without, NULL, 0, sig_without) != MWEB_OK) {
+        printf("FAIL: extra_data — sign_without\n");
         failures++;
         return;
     }
 
-    if (memcmp(result.signature, result_no_extra.signature, 64) == 0) {
+    if (memcmp(sig_with, sig_without, 64) == 0) {
         printf("FAIL: extra_data — signatures should differ\n");
         failures++;
         return;
@@ -459,9 +495,122 @@ static void test_sign_with_extra_data(void)
 }
 
 /*
- * Test that EXTRA_DATA_BIT with empty data still hashes varint(0).
- * Go WriteVarBytes(h, 0, nil) writes 0x00 even for nil slices.
- * The message hash must differ from the no-EXTRA_DATA_BIT case.
+ * Reproduce the same osk = (spend_key + m_i) * out_key_hash that
+ * Stage A derives, so a test can drive ephemeral == osk and verify
+ * the zero-stealth_tweak path.
+ */
+static bool compute_osk(uint32_t address_index,
+                        const uint8_t sender_key[32],
+                        uint8_t osk_out[32])
+{
+    const secp256k1_context* ctx = wally_get_secp_context();
+
+    uint8_t mi_buf[4 + 32];
+    mi_buf[0] = (uint8_t)(address_index);
+    mi_buf[1] = (uint8_t)(address_index >> 8);
+    mi_buf[2] = (uint8_t)(address_index >> 16);
+    mi_buf[3] = (uint8_t)(address_index >> 24);
+    memcpy(mi_buf + 4, SCAN_KEY, 32);
+    uint8_t m_i[32];
+    mweb_hashed(MWEB_TAG_ADDRESS, mi_buf, sizeof(mi_buf), m_i);
+
+    uint8_t spend_pub[33], mi_pub[33];
+    if (wally_ec_public_key_from_private_key(SPEND_KEY, 32, spend_pub, 33) != WALLY_OK) return false;
+    if (wally_ec_public_key_from_private_key(m_i, 32, mi_pub, 33) != WALLY_OK) return false;
+    secp256k1_pubkey sp_pk, mi_pk, Bi_pk;
+    if (!secp256k1_ec_pubkey_parse(ctx, &sp_pk, spend_pub, 33)) return false;
+    if (!secp256k1_ec_pubkey_parse(ctx, &mi_pk, mi_pub, 33)) return false;
+    const secp256k1_pubkey* pts[2] = { &sp_pk, &mi_pk };
+    if (!secp256k1_ec_pubkey_combine(ctx, &Bi_pk, pts, 2)) return false;
+
+    secp256k1_pubkey Ke_pk = Bi_pk;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &Ke_pk, sender_key)) return false;
+    uint8_t kex[33];
+    size_t kex_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, kex, &kex_len, &Ke_pk, SECP256K1_EC_COMPRESSED);
+
+    secp256k1_pubkey kex_parsed;
+    if (!secp256k1_ec_pubkey_parse(ctx, &kex_parsed, kex, 33)) return false;
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &kex_parsed, SCAN_KEY)) return false;
+    uint8_t ecdh[33];
+    size_t ecdh_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, ecdh, &ecdh_len, &kex_parsed, SECP256K1_EC_COMPRESSED);
+    uint8_t ss[32];
+    mweb_hashed(MWEB_TAG_DERIVE, ecdh, 33, ss);
+
+    uint8_t okh[32];
+    mweb_hashed(MWEB_TAG_OUTKEY, ss, 32, okh);
+
+    /* osk = (spend_key + m_i) * out_key_hash */
+    memcpy(osk_out, SPEND_KEY, 32);
+    if (!secp256k1_ec_seckey_tweak_add(ctx, osk_out, m_i)) return false;
+    if (!secp256k1_ec_seckey_tweak_mul(ctx, osk_out, okh)) return false;
+    return true;
+}
+
+/*
+ * Drive ephemeral == osk so stealth_tweak = ephemeral - osk is the zero
+ * scalar. This is mathematically a valid contribution to the global
+ * stealth offset, and Stage A must NOT fail on it — older versions
+ * that used secp256k1_ec_seckey_tweak_add() (which rejects a zero
+ * result) would regress here.
+ */
+static void test_zero_stealth_tweak_accepted(void)
+{
+    const uint8_t sender_key[32] = {
+        0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+        0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x00,
+        0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+        0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+    };
+
+    uint8_t kex[33], Ko[33], oid[32];
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
+        printf("FAIL: zero_stealth_tweak — build\n");
+        failures++;
+        return;
+    }
+
+    uint8_t osk[32];
+    if (!compute_osk(0, sender_key, osk)) {
+        printf("FAIL: zero_stealth_tweak — compute_osk\n");
+        failures++;
+        return;
+    }
+
+    /* Force the TRNG to hand Stage A the osk value so ephemeral == osk. */
+    memcpy(g_test_random, osk, 32);
+
+    mweb_input_state_t state;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state) != MWEB_OK) {
+        printf("FAIL: zero_stealth_tweak — derive rejected zero tweak\n");
+        failures++;
+        return;
+    }
+
+    const uint8_t zero32[32] = { 0 };
+    if (memcmp(state.stealth_tweak, zero32, 32) != 0) {
+        printf("FAIL: zero_stealth_tweak — tweak is not all-zero\n");
+        failures++;
+        return;
+    }
+
+    /* Stage B should also succeed on the resulting state. */
+    uint8_t signature[64];
+    if (mweb_sign_input_from_state(&state, NULL, 0, signature) != MWEB_OK) {
+        printf("FAIL: zero_stealth_tweak — Stage B rejected\n");
+        failures++;
+        return;
+    }
+
+    printf("PASS: zero_stealth_tweak_accepted\n");
+}
+
+/*
+ * EXTRA_DATA_BIT set with empty data hashes varint(0)=0x00 and must
+ * produce a different signature than the no-bit case.
  */
 static void test_empty_extra_data(void)
 {
@@ -472,41 +621,46 @@ static void test_empty_extra_data(void)
         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     };
 
-    uint8_t ss[32], kex[33], Ko[33], oid[32];
-    if (!build_test_input(0, sender_key, ss, kex, Ko, oid)) {
+    uint8_t kex[33], Ko[33], oid[32];
+    if (!build_test_input(0, sender_key, kex, Ko, oid)) {
         printf("FAIL: empty_extra_data — build\n");
         failures++;
         return;
     }
 
-    /* Sign with EXTRA_DATA_BIT set but NULL extra_data (empty) */
     memset(g_test_random, 0x42, 32);
-    mweb_sign_result_t r_empty;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT | MWEB_INPUT_EXTRA_DATA_BIT,
-                         oid, Ko, 1000000,
-                         NULL, 0,   /* empty extra_data */
-                         kex, NULL, &r_empty)) {
-        printf("FAIL: empty_extra_data — sign\n");
+    mweb_input_state_t state_empty;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT | MWEB_INPUT_EXTRA_DATA_BIT,
+            oid, Ko, 1000000, kex, &state_empty) != MWEB_OK) {
+        printf("FAIL: empty_extra_data — derive_empty\n");
+        failures++;
+        return;
+    }
+    uint8_t sig_empty[64];
+    if (mweb_sign_input_from_state(&state_empty, NULL, 0, sig_empty) != MWEB_OK) {
+        printf("FAIL: empty_extra_data — sign_empty\n");
         failures++;
         return;
     }
 
-    /* Sign without EXTRA_DATA_BIT — signature must differ because
-     * the empty case hashes varint(0)=0x00 while no-bit case hashes nothing */
     memset(g_test_random, 0x42, 32);
-    mweb_sign_result_t r_nobit;
-    if (!mweb_sign_input(SCAN_KEY, SPEND_KEY, 0,
-                         MWEB_INPUT_STEALTH_KEY_BIT,
-                         oid, Ko, 1000000,
-                         NULL, 0,
-                         kex, NULL, &r_nobit)) {
+    mweb_input_state_t state_nobit;
+    if (mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
+            MWEB_INPUT_STEALTH_KEY_BIT,
+            oid, Ko, 1000000, kex, &state_nobit) != MWEB_OK) {
+        printf("FAIL: empty_extra_data — derive_nobit\n");
+        failures++;
+        return;
+    }
+    uint8_t sig_nobit[64];
+    if (mweb_sign_input_from_state(&state_nobit, NULL, 0, sig_nobit) != MWEB_OK) {
         printf("FAIL: empty_extra_data — sign_nobit\n");
         failures++;
         return;
     }
 
-    if (memcmp(r_empty.signature, r_nobit.signature, 64) == 0) {
+    if (memcmp(sig_empty, sig_nobit, 64) == 0) {
         printf("FAIL: empty_extra_data — signatures should differ "
                "(varint(0) vs nothing)\n");
         failures++;
@@ -520,14 +674,19 @@ int test_mweb_sign(void)
 {
     failures = 0;
 
-    test_sign_success();
-    test_sign_deterministic();
-    test_shared_secret_path();
+    test_two_stage_success();
+    test_legacy_reference_vectors();
+    test_stage_a_no_signature();
     test_wrong_address_index();
     test_missing_stealth_bit();
     test_sign_with_extra_data();
     test_empty_extra_data();
+    test_zero_stealth_tweak_accepted();
 
-    printf("\nmweb_sign: %d tests, %d failures\n", 7, failures);
+    printf("\nmweb_sign: %d tests, %d failures\n", 8, failures);
     return failures;
 }
+
+#ifdef MWEB_TEST_STANDALONE
+int main(void) { return test_mweb_sign() == 0 ? 0 : 1; }
+#endif

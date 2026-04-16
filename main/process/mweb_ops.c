@@ -147,6 +147,8 @@ cleanup:
 /*
  * sign_mweb_input — Sign an MWEB input (standalone RPC).
  *
+ * Wrapper over the two-stage API so the dispatch table keeps linking.
+ *
  * Params: {
  *   "network": "litecoin",
  *   "features": 1,
@@ -167,10 +169,18 @@ cleanup:
  * }
  */
 
+typedef struct {
+    uint8_t signature[64];
+    uint8_t input_blind[32];
+    uint8_t stealth_tweak[32];
+    uint8_t input_pubkey[33];
+    uint8_t output_commit[33];
+} mweb_sign_cbor_result_t;
+
 static void sign_mweb_result_cb(const void* ctx, CborEncoder* container)
 {
     JADE_ASSERT(ctx);
-    const mweb_sign_result_t* result = (const mweb_sign_result_t*)ctx;
+    const mweb_sign_cbor_result_t* result = (const mweb_sign_cbor_result_t*)ctx;
 
     CborEncoder map_encoder;
     CborError cberr = cbor_encoder_create_map(container, &map_encoder, 5);
@@ -263,13 +273,11 @@ void sign_mweb_input_process(void* process_ptr)
         goto cleanup;
     }
 
-    /* Sign the input */
-    mweb_sign_result_t result;
-    if (!mweb_sign_input(scan_key, spend_key, (uint32_t)address_index,
-                         features, spent_output_id, spent_output_pk, amount,
-                         extra_data, extra_data_len,
-                         key_exchange_pk, NULL, /* key_exchange_pk path, Jade derives shared_secret */
-                         &result)) {
+    /* Two-stage signing: Stage A derivation then Stage B Schnorr emission. */
+    mweb_input_state_t state;
+    if (mweb_derive_input_state(scan_key, spend_key, (uint32_t)address_index,
+            features, spent_output_id, spent_output_pk, amount,
+            key_exchange_pk, &state) != MWEB_OK) {
         SENSITIVE_POP(spend_key);
         SENSITIVE_POP(scan_key);
         jade_process_reject_message(process, CBOR_RPC_INTERNAL_ERROR, "MWEB input signing failed");
@@ -279,9 +287,24 @@ void sign_mweb_input_process(void* process_ptr)
     SENSITIVE_POP(spend_key);
     SENSITIVE_POP(scan_key);
 
+    mweb_sign_cbor_result_t result;
+    if (mweb_sign_input_from_state(&state, extra_data, extra_data_len,
+            result.signature) != MWEB_OK) {
+        wally_bzero(&state, sizeof(state));
+        jade_process_reject_message(process, CBOR_RPC_INTERNAL_ERROR, "MWEB input signing failed");
+        goto cleanup;
+    }
+
+    memcpy(result.input_blind, state.blind, 32);
+    memcpy(result.stealth_tweak, state.stealth_tweak, 32);
+    memcpy(result.input_pubkey, state.input_pubkey, 33);
+    memcpy(result.output_commit, state.output_commit, 33);
+    wally_bzero(&state, sizeof(state));
+
     /* Return result map */
     uint8_t buf[512];
     jade_process_reply_to_message_result(process->ctx, buf, sizeof(buf), &result, sign_mweb_result_cb);
+    wally_bzero(&result, sizeof(result));
     JADE_LOGI("Success");
 
 cleanup:
