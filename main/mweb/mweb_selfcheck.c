@@ -13,6 +13,7 @@
 #include "mweb_blind.h"
 #include "mweb_sign.h"
 #include "mweb_keychain.h"
+#include "mweb_kernel.h"
 
 #include <string.h>
 #include <secp256k1.h>
@@ -484,6 +485,39 @@ static bool test_mweb_watch_only_consistency(void)
     return true;
 }
 
+/* ── Kernel message hash vector ──────────────────────────────────────── */
+
+static bool test_mweb_kernel_hash(void)
+{
+    static const uint8_t EXCESS[33] = {
+        0x08,
+        0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,
+        0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,
+        0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,
+        0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,0xa1,
+    };
+    static const uint8_t EXPECTED[32] = {
+        0x1b,0x0e,0xe8,0xf6,0x39,0x43,0x41,0x3d,
+        0x8e,0x6d,0x0b,0xe3,0x68,0x40,0xe2,0x25,
+        0xf8,0xca,0xa4,0x0d,0x19,0xec,0xd1,0x05,
+        0xfb,0x13,0x54,0x26,0x69,0x96,0xb6,0x3c,
+    };
+
+    uint8_t hash[32];
+    if (!mweb_kernel_sig_hash(MWEB_KERNEL_FEE_BIT, EXCESS,
+                              50000, true,
+                              0, false,
+                              NULL,
+                              0, false,
+                              NULL, NULL, 0,
+                              hash)) {
+        FAIL();
+    }
+    if (memcmp(hash, EXPECTED, 32) != 0) { FAIL(); }
+
+    return true;
+}
+
 /* ── Top-level entry point for selfcheck.c ───────────────────────────── */
 
 bool test_mweb_crypto(void)
@@ -495,6 +529,7 @@ bool test_mweb_crypto(void)
     if (!test_mweb_addresses()) { return false; }
     if (!test_mweb_watch_only_consistency()) { return false; }
     if (!test_mweb_sign_properties()) { return false; }
+    if (!test_mweb_kernel_hash()) { return false; }
     return true;
 }
 
