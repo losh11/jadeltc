@@ -2091,61 +2091,6 @@ class JadeAPI:
         params = {'network': network, 'index': index}
         return self._jadeRpc('get_mweb_address', params, long_timeout=True)
 
-    def sign_mweb_input(self, network, features, spent_output_id,
-                        spent_output_pk, amount, key_exchange_pk,
-                        address_index, extra_data=None):
-        """
-        RPC call to sign an MWEB input with full output key verification.
-        Uses standard derivation m/0'/100'/0' (scan) and m/0'/100'/1' (spend).
-
-        The caller must update MwebTxOffset and MwebStealthOffset in the PSBT
-        using the returned input_blind and stealth_tweak values.
-
-        Parameters
-        ----------
-        network : str
-            Network - 'litecoin', 'testnet-litecoin', or 'localtest-litecoin'
-
-        features : int
-            MWEB input feature flags (must have STEALTH_KEY_BIT = 0x01)
-
-        spent_output_id : bytes
-            32-byte output ID being spent
-
-        spent_output_pk : bytes
-            33-byte compressed public key of the spent output
-
-        amount : int
-            Amount in litoshis
-
-        key_exchange_pk : bytes
-            33-byte key exchange public key (Jade derives shared secret on-device)
-
-        address_index : int
-            MWEB subaddress index for output key verification
-
-        extra_data : bytes, optional
-            Extra data if EXTRA_DATA_BIT is set in features
-
-        Returns
-        -------
-        dict
-            {signature: bytes(64), input_blind: bytes(32), stealth_tweak: bytes(32),
-             input_pubkey: bytes(33), output_commit: bytes(33)}
-        """
-        params = {
-            'network': network,
-            'features': features,
-            'spent_output_id': spent_output_id,
-            'spent_output_pk': spent_output_pk,
-            'amount': amount,
-            'key_exchange_pk': key_exchange_pk,
-            'address_index': address_index,
-        }
-        if extra_data is not None:
-            params['extra_data'] = extra_data
-        return self._jadeRpc('sign_mweb_input', params, long_timeout=True)
-
     def sign_psbt(self, network, psbt, additional_info=None):
         """
         RPC call to sign a passed psbt as required

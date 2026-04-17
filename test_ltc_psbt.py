@@ -3,7 +3,7 @@
 End-to-end PSBT signing tests against a real Jade device.
 
 Test 1: Standard LTC PSBTv0 signing (P2WPKH)
-Test 2: MWEB input signing via standalone RPC (sign_mweb_input)
+Test 2: Regression — sign_mweb_input RPC is removed (returns UNKNOWN_METHOD)
 Test 3: Pure-MWEB PSBTv2 signing via sign_psbt
 
 Requirements (serial):
@@ -632,75 +632,42 @@ def test_standard_ltc(jade):
 
 
 # ---------------------------------------------------------------------------
-#  Test 2: MWEB Input Signing
+#  Test 2: sign_mweb_input RPC removal (regression)
 # ---------------------------------------------------------------------------
 
-def test_mweb(jade, mweb_ctx):
-    print("\n=== Test 2: MWEB Input Signing (standalone RPC) ===\n")
+def test_sign_mweb_input_removed(jade):
+    """
+    The standalone sign_mweb_input RPC has been removed; the atomic sign_psbt
+    path (Test 3) is now the only way to produce an MWEB input signature.
+    Invoking the method directly must be rejected as UNKNOWN_METHOD (-32601).
+    Dummy parameters are sufficient because dashboard.c rejects the method
+    before any parameter validation.
+    """
+    print("\n=== Test 2: sign_mweb_input RPC removed (regression) ===\n")
 
-    scan_key = mweb_ctx['scan_key']
-    scan_pub = mweb_ctx['scan_pub']
-    spend_pub = mweb_ctx['spend_pub']
-
-    print(f"  Scan key: {scan_key.hex()}", flush=True)
-    print(f"  Scan pubkey: {scan_pub.hex()}", flush=True)
-    print(f"  Master fingerprint: {mweb_ctx['fingerprint']:08x}", flush=True)
-    print(f"  Spend pubkey: {spend_pub.hex()}", flush=True)
-
-    # 2. Generate random key exchange keypair
-    kex_secret = random_valid_secret()
-    kex_pk = ec_pubkey(kex_secret)
-    print(f"  Key exchange pubkey: {kex_pk.hex()}", flush=True)
-
-    # 3. Derive MWEB output key for address_index=0
-    address_index = 0
-    shared_secret, Ko = derive_mweb_spent_output_pubkey(
-        scan_key, spend_pub, address_index, kex_pk)
-    print(f"  Shared secret: {shared_secret.hex()}", flush=True)
-    print(f"  Expected output key (Ko): {Ko.hex()}", flush=True)
-
-    # 4. Sign the MWEB input directly.
-    # Current firmware support for pure-MWEB PSBT signing is still tripping the
-    # standard UTXO validation path; use the dedicated RPC for stable coverage.
-    spent_output_id = os.urandom(32)
-    input_amount = 100000  # 0.001 LTC
-    features = 0x01  # STEALTH_KEY_BIT
-
-    print("  Sending MWEB input to Jade for signing... (confirm on device)", flush=True)
-    result = jade.sign_mweb_input(
-        'litecoin',
-        features,
-        spent_output_id,
-        Ko,
-        input_amount,
-        kex_pk,
-        address_index,
-    )
-
-    signature = bytes(result['signature'])
-    input_blind = bytes(result['input_blind'])
-    stealth_tweak = bytes(result['stealth_tweak'])
-    input_pubkey = bytes(result['input_pubkey'])
-    output_commit = bytes(result['output_commit'])
-
-    print(f"  Signature ({len(signature)} bytes): {signature.hex()}", flush=True)
-    print(f"  Input blind: {input_blind.hex()}", flush=True)
-    print(f"  Stealth tweak: {stealth_tweak.hex()}", flush=True)
-    print(f"  Input pubkey: {input_pubkey.hex()}", flush=True)
-    print(f"  Output commit: {output_commit.hex()}", flush=True)
-
-    assert len(signature) == 64, f"Expected 64-byte MWEB signature, got {len(signature)}"
-    assert len(input_blind) == 32, f"Expected 32-byte input blind, got {len(input_blind)}"
-    assert len(stealth_tweak) == 32, f"Expected 32-byte stealth tweak, got {len(stealth_tweak)}"
-    assert len(input_pubkey) == 33, f"Expected 33-byte input pubkey, got {len(input_pubkey)}"
-    assert len(output_commit) == 33, f"Expected 33-byte output commit, got {len(output_commit)}"
-    assert any(signature), "MWEB signature is all zeroes"
-    assert any(input_blind), "MWEB input blind is all zeroes"
-    assert any(stealth_tweak), "MWEB stealth tweak is all zeroes"
-    assert output_commit[0] in (0x08, 0x09), f"Bad commit prefix: 0x{output_commit[0]:02x}"
-
-    print("\n  *** Test 2 PASSED ***")
-    return True
+    dummy = {
+        'network': 'litecoin',
+        'features': 0x01,
+        'spent_output_id': b'\x00' * 32,
+        'spent_output_pk': b'\x02' + b'\x00' * 32,
+        'amount': 100000,
+        'key_exchange_pk': b'\x02' + b'\x00' * 32,
+        'address_index': 0,
+    }
+    try:
+        jade._jadeRpc('sign_mweb_input', dummy)
+    except JadeError as e:
+        if e.code == JadeError.UNKNOWN_METHOD:
+            print(f"  Rejected with UNKNOWN_METHOD as expected (code={e.code}, message={e.message!r})",
+                  flush=True)
+            print("\n  *** Test 2 PASSED ***")
+            return True
+        print(f"  Unexpected error code={e.code} message={e.message!r}", flush=True)
+        print("\n  *** Test 2 FAILED ***")
+        return False
+    print("  ERROR: sign_mweb_input succeeded — the RPC should be removed!", flush=True)
+    print("\n  *** Test 2 FAILED ***")
+    return False
 
 
 def test_mweb_psbt(jade, mweb_ctx):
@@ -877,12 +844,11 @@ def _run_tests(jade, args, is_ble):
             import traceback; traceback.print_exc()
             failed += 1
 
-        mweb_ctx = None
-
-        # Test 2
+        # Test 2 — regression: sign_mweb_input RPC removed.
+        # Uses no mweb_ctx because the dashboard rejects the method before
+        # any parameters are parsed.
         try:
-            mweb_ctx = get_mweb_context(jade)
-            if test_mweb(jade, mweb_ctx):
+            if test_sign_mweb_input_removed(jade):
                 passed += 1
             else:
                 failed += 1
@@ -893,8 +859,7 @@ def _run_tests(jade, args, is_ble):
 
         # Test 3
         try:
-            if mweb_ctx is None:
-                mweb_ctx = get_mweb_context(jade)
+            mweb_ctx = get_mweb_context(jade)
             if test_mweb_psbt(jade, mweb_ctx):
                 passed += 1
             else:

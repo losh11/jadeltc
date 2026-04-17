@@ -151,7 +151,6 @@ void sign_bip85_digests_process(void* process_ptr);
 void get_mweb_scan_key_process(void* process_ptr);
 void get_mweb_watch_keys_process(void* process_ptr);
 void get_mweb_address_process(void* process_ptr);
-void sign_mweb_input_process(void* process_ptr);
 #ifdef CONFIG_DEBUG_MODE
 void get_bip85_bip39_entropy_process(void* process_ptr);
 void get_bip85_rsa_entropy_process(void* process_ptr);
@@ -603,8 +602,6 @@ static void dispatch_message(jade_process_t* process)
             task_function = get_mweb_watch_keys_process;
         } else if (IS_METHOD("get_mweb_address")) {
             task_function = get_mweb_address_process;
-        } else if (IS_METHOD("sign_mweb_input")) {
-            task_function = sign_mweb_input_process;
         } else if (IS_METHOD("get_blinding_key")) {
             task_function = get_blinding_key_process;
         } else if (IS_METHOD("get_shared_nonce")) {
