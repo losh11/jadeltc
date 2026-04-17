@@ -38,6 +38,7 @@
 #include <wally_crypto.h>
 #include <wally_map.h>
 #include <wally_psbt.h>
+#include <wally_script.h>
 
 /*
  * Max BIP32 path depth for key-origin derivation. The core value is
@@ -212,6 +213,18 @@ struct mweb_session {
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
+/*
+ * Litecoin MoneyRange: a valid amount is 0 ≤ amount ≤ 84_000_000 * 10^8
+ * litoshi. The cap is below 2^53 so every accepted amount renders
+ * exactly via `double` in the UI formatter.
+ */
+#define MWEB_LTC_MAX_LITOSHI ((uint64_t)84000000 * (uint64_t)100000000)
+
+static inline bool atomic_in_money_range(uint64_t amount)
+{
+    return amount <= MWEB_LTC_MAX_LITOSHI;
+}
+
 static bool atomic_u64_add(uint64_t a, uint64_t b, uint64_t *out)
 {
     if (a > UINT64_MAX - b) {
@@ -219,6 +232,36 @@ static bool atomic_u64_add(uint64_t a, uint64_t b, uint64_t *out)
     }
     *out = a + b;
     return true;
+}
+
+/*
+ * Classify a pegout scriptPubKey. Pegouts must land on a spendable
+ * transparent Litecoin address so the user can verify the destination;
+ * Jade rejects types it cannot decode into a displayable address
+ * (including OP_RETURN and multisig-bare templates). This keeps the
+ * pegout confirmation screen honest: the user never sees an empty or
+ * "Unknown Address" label while the underlying script could still pay
+ * an attacker-chosen destination.
+ */
+static bool atomic_pegout_script_supported(const uint8_t *script, size_t script_len)
+{
+    if (!script || !script_len) {
+        return false;
+    }
+    size_t script_type = 0;
+    if (wally_scriptpubkey_get_type(script, script_len, &script_type) != WALLY_OK) {
+        return false;
+    }
+    switch (script_type) {
+    case WALLY_SCRIPT_TYPE_P2PKH:
+    case WALLY_SCRIPT_TYPE_P2SH:
+    case WALLY_SCRIPT_TYPE_P2WPKH:
+    case WALLY_SCRIPT_TYPE_P2WSH:
+    case WALLY_SCRIPT_TYPE_P2TR:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static bool atomic_parse_pegout(const uint8_t *val, size_t val_len,
@@ -902,9 +945,20 @@ mweb_err_t mweb_session_begin(
             goto fail;
         }
 
+        /* MoneyRange: every user-visible amount must be within the LTC
+         * supply cap (84M LTC) so UI formatting stays exact in double
+         * precision and obviously-invalid host values reject before
+         * the balance check (which only traps u64 overflow). */
+        if (!atomic_in_money_range(in->mweb_input_amount)) {
+            wally_bzero(&si, sizeof(si));
+            err = MWEB_ERR_BALANCE_FAIL;
+            goto fail;
+        }
+
         /* Record total before the struct moves so we trap overflow early. */
         if (!atomic_u64_add(s->total_input_value,
-                in->mweb_input_amount, &s->total_input_value)) {
+                in->mweb_input_amount, &s->total_input_value)
+            || !atomic_in_money_range(s->total_input_value)) {
             wally_bzero(&si, sizeof(si));
             err = MWEB_ERR_BALANCE_FAIL;
             goto fail;
@@ -929,8 +983,14 @@ mweb_err_t mweb_session_begin(
             err = oe;
             goto fail;
         }
+        if (!atomic_in_money_range(so.value)) {
+            wally_bzero(&so, sizeof(so));
+            err = MWEB_ERR_BALANCE_FAIL;
+            goto fail;
+        }
         if (!atomic_u64_add(s->total_output_value, so.value,
-                &s->total_output_value)) {
+                &s->total_output_value)
+            || !atomic_in_money_range(s->total_output_value)) {
             wally_bzero(&so, sizeof(so));
             err = MWEB_ERR_BALANCE_FAIL;
             goto fail;
@@ -944,6 +1004,12 @@ mweb_err_t mweb_session_begin(
     s->total_fee   = kernel->has_fee          ? kernel->fee          : 0;
     s->total_pegin = kernel->has_pegin_amount ? kernel->pegin_amount : 0;
     s->has_pegin   = kernel->has_pegin_amount != 0;
+
+    if (!atomic_in_money_range(s->total_fee)
+        || !atomic_in_money_range(s->total_pegin)) {
+        err = MWEB_ERR_BALANCE_FAIL;
+        goto fail;
+    }
 
     if (kernel->pegouts.num_items > 0) {
         s->pegouts = calloc(kernel->pegouts.num_items, sizeof(s->pegouts[0]));
@@ -959,6 +1025,18 @@ mweb_err_t mweb_session_begin(
                 err = MWEB_ERR_KERNEL_FEATURE_MISMATCH;
                 goto fail;
             }
+            if (!atomic_in_money_range(amount)) {
+                err = MWEB_ERR_BALANCE_FAIL;
+                goto fail;
+            }
+            if (!atomic_pegout_script_supported(script, script_len)) {
+                /* A pegout whose scriptPubKey is not a decodable
+                 * Litecoin address cannot be confirmed by the user. Reject
+                 * here rather than let the UI render "Unknown Address"
+                 * and mark the pegout confirmed regardless. */
+                err = MWEB_ERR_KERNEL_FEATURE_MISMATCH;
+                goto fail;
+            }
             s->pegouts[s->n_pegouts].kernel_index = 0;
             s->pegouts[s->n_pegouts].amount       = amount;
             s->pegouts[s->n_pegouts].script       = script;
@@ -966,7 +1044,8 @@ mweb_err_t mweb_session_begin(
             s->pegouts[s->n_pegouts].confirmed    = false;
             s->n_pegouts++;
 
-            if (!atomic_u64_add(s->total_pegout, amount, &s->total_pegout)) {
+            if (!atomic_u64_add(s->total_pegout, amount, &s->total_pegout)
+                || !atomic_in_money_range(s->total_pegout)) {
                 err = MWEB_ERR_BALANCE_FAIL;
                 goto fail;
             }

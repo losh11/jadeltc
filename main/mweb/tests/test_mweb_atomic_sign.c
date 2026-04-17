@@ -345,6 +345,177 @@ static void test_begin_rejects_non_litecoin(void)
 }
 
 /*
+ * ── Helpers for kernel-field rejection tests ──────────────────────────
+ *
+ * These tests exercise the kernel validation path (MoneyRange on fee /
+ * pegin / pegouts, pegout script type classifier). They construct a
+ * PSBTv2 with zero inputs + zero outputs and one in-tree wally_psbt_kernel
+ * populated directly — the input/output loops are no-ops so the session
+ * reaches the kernel block under test.
+ */
+#define MWEB_TEST_LTC_MAX_LITOSHI ((uint64_t)84000000 * (uint64_t)100000000)
+
+static void u64_to_le(uint64_t v, uint8_t out[8])
+{
+    for (int i = 0; i < 8; ++i) {
+        out[i] = (uint8_t)(v >> (i * 8));
+    }
+}
+
+/*
+ * Build a pegout map entry payload: 8-byte LE amount || varint script_len
+ * || script. `script_len` fits in a single-byte varint for test data we
+ * use (< 0xfd bytes), keeping the writer trivial.
+ */
+static size_t build_pegout_value(uint64_t amount,
+                                 const uint8_t *script, size_t script_len,
+                                 uint8_t *buf, size_t buf_cap)
+{
+    if (script_len >= 0xfd || buf_cap < 8 + 1 + script_len) {
+        return 0;
+    }
+    u64_to_le(amount, buf);
+    buf[8] = (uint8_t)script_len;
+    memcpy(buf + 9, script, script_len);
+    return 8 + 1 + script_len;
+}
+
+/*
+ * Run session_begin against an empty PSBT holding a single, stack-owned
+ * kernel populated by `prepare`. Asserts the returned mweb_err_t matches
+ * `expected_err`. Handles the kernel-pointer bookkeeping so psbt_free
+ * never touches the stack buffer.
+ */
+static void run_kernel_reject_case(const char *tag,
+                                    void (*prepare)(struct wally_psbt_kernel *),
+                                    mweb_err_t expected_err)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 0, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: %s — wally_psbt_init_alloc\n", tag);
+        failures++;
+        return;
+    }
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    prepare(&kernel);
+
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0; /* We own the buffer, libwally must not free it. */
+
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    /* Tear the borrowed kernel out of the PSBT before libwally frees it. */
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+
+    wally_psbt_free(psbt);
+
+    if (err != expected_err) {
+        printf("FAIL: %s — expected %d got %d\n", tag, expected_err, err);
+        failures++;
+        return;
+    }
+    if (s != NULL) {
+        printf("FAIL: %s — session not cleared\n", tag);
+        failures++;
+        return;
+    }
+    printf("PASS: %s\n", tag);
+}
+
+/* Feature bits mirror main/mweb/mweb_kernel.h. Copied locally so the test
+ * is independent of that header's include chain. */
+#define MWEB_TEST_FEE_BIT    0x01
+#define MWEB_TEST_PEGIN_BIT  0x02
+#define MWEB_TEST_PEGOUT_BIT 0x04
+
+static void prep_fee_out_of_range(struct wally_psbt_kernel *k)
+{
+    k->has_fee = 1;
+    k->fee = MWEB_TEST_LTC_MAX_LITOSHI + 1;
+    k->has_features = 1;
+    k->features = MWEB_TEST_FEE_BIT;
+}
+
+static void prep_pegin_out_of_range(struct wally_psbt_kernel *k)
+{
+    k->has_pegin_amount = 1;
+    k->pegin_amount = MWEB_TEST_LTC_MAX_LITOSHI + 1;
+    k->has_features = 1;
+    k->features = MWEB_TEST_PEGIN_BIT;
+}
+
+static void prep_pegout_amount_out_of_range(struct wally_psbt_kernel *k)
+{
+    /* P2WPKH-shaped script so the pegout-script classifier accepts it;
+     * the rejection must come from the amount MoneyRange check. */
+    static const uint8_t p2wpkh[22] = {
+        0x00, 0x14,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+        0x11, 0x22, 0x33, 0x44,
+    };
+    static uint8_t pegout_buf[32];
+    const size_t n = build_pegout_value(
+        MWEB_TEST_LTC_MAX_LITOSHI + 1, p2wpkh, sizeof(p2wpkh),
+        pegout_buf, sizeof(pegout_buf));
+    if (n == 0) { return; }
+
+    wally_map_init(1, NULL, &k->pegouts);
+    wally_map_add_integer(&k->pegouts, 0, pegout_buf, n);
+    k->has_features = 1;
+    k->features = MWEB_TEST_PEGOUT_BIT;
+}
+
+static void prep_pegout_unknown_script(struct wally_psbt_kernel *k)
+{
+    /* A single OP_0 byte is not a P2PKH / P2SH / P2WPKH / P2WSH / P2TR
+     * script, so wally_scriptpubkey_get_type classifies it as UNKNOWN
+     * and the pegout classifier MUST reject. */
+    static const uint8_t unknown_script[1] = { 0x00 };
+    static uint8_t pegout_buf[32];
+    const size_t n = build_pegout_value(
+        1000, unknown_script, sizeof(unknown_script),
+        pegout_buf, sizeof(pegout_buf));
+    if (n == 0) { return; }
+
+    wally_map_init(1, NULL, &k->pegouts);
+    wally_map_add_integer(&k->pegouts, 0, pegout_buf, n);
+    k->has_features = 1;
+    k->features = MWEB_TEST_PEGOUT_BIT;
+}
+
+static void test_money_range_fee_rejected(void)
+{
+    run_kernel_reject_case("money_range_fee_rejected",
+        prep_fee_out_of_range, MWEB_ERR_BALANCE_FAIL);
+}
+
+static void test_money_range_pegin_rejected(void)
+{
+    run_kernel_reject_case("money_range_pegin_rejected",
+        prep_pegin_out_of_range, MWEB_ERR_BALANCE_FAIL);
+}
+
+static void test_money_range_pegout_amount_rejected(void)
+{
+    run_kernel_reject_case("money_range_pegout_amount_rejected",
+        prep_pegout_amount_out_of_range, MWEB_ERR_BALANCE_FAIL);
+}
+
+static void test_pegout_unknown_script_rejected(void)
+{
+    run_kernel_reject_case("pegout_unknown_script_rejected",
+        prep_pegout_unknown_script, MWEB_ERR_KERNEL_FEATURE_MISMATCH);
+}
+
+/*
  * Abort on a never-begun session is a no-op; callers use this idiom in
  * the cleanup path after a `goto cleanup` that occurred before any
  * mweb_session_begin() call completed.
@@ -376,9 +547,13 @@ int test_mweb_atomic_sign(void)
     test_begin_rejects_missing_kernel();
     test_begin_rejects_multi_kernel();
     test_begin_rejects_non_litecoin();
+    test_money_range_fee_rejected();
+    test_money_range_pegin_rejected();
+    test_money_range_pegout_amount_rejected();
+    test_pegout_unknown_script_rejected();
     test_abort_null_session_no_crash();
 
-    printf("\nmweb_atomic_sign: 7 tests, %d failures\n", failures);
+    printf("\nmweb_atomic_sign: 11 tests, %d failures\n", failures);
     return failures;
 }
 

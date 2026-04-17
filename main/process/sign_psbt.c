@@ -1362,20 +1362,10 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
             // (input side) and to the kernel signature hash; without
             // explicit confirmation, a malicious host could pull
             // transparent value into MWEB without the user approving
-            // it as a distinct destination-like action. Reuse the
-            // MWEB-output confirmation screen with a pegin-marked
-            // title until a dedicated pegin UI lands.
+            // it as a distinct destination-like action.
             if (mweb_session && mweb_session_has_pegin(mweb_session)) {
-                const uint64_t pegin_amount =
-                    mweb_session_pegin_amount(mweb_session);
-                char pegin_amount_str[32];
-                int pret = snprintf(pegin_amount_str, sizeof(pegin_amount_str),
-                    "%.08f", 1.0 * pegin_amount / 1e8);
-                JADE_ASSERT(pret > 0 && pret < (int)sizeof(pegin_amount_str));
-
-                if (!show_mweb_output_activity("Pegin",
-                        "(transparent input)",
-                        pegin_amount_str, network_id)) {
+                if (!show_mweb_pegin_activity(
+                        mweb_session_pegin_amount(mweb_session), network_id)) {
                     *errmsg = "User declined to sign psbt";
                     retval = CBOR_RPC_USER_CANCELLED;
                     goto cleanup;

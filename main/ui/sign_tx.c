@@ -79,8 +79,27 @@ static uint32_t displayable_outputs(
         }
     }
 
+    if (nDisplayable > 0) {
+        return nDisplayable;
+    }
+
+    // If every output would be hidden and at least one is MWEB, those
+    // MWEB outputs are displayed via show_mweb_output_activity() from the
+    // verified session — don't fall back to rendering them through this
+    // screen, which would source amounts from tx->outputs[i].satoshi and
+    // produce "To: No Address" (MWEB outputs carry no script). Returning
+    // 0 here makes show_btc_transaction_outputs_activity() skip the
+    // standard loop entirely; session-sourced screens still run.
+    if (output_info) {
+        for (size_t i = 0; i < tx->num_outputs; ++i) {
+            if (output_info[i].flags & OUTPUT_FLAG_MWEB) {
+                return 0;
+            }
+        }
+    }
+
     // If we would hide all outputs, then don't hide any
-    return nDisplayable > 0 ? nDisplayable : tx->num_outputs;
+    return tx->num_outputs;
 }
 
 // Lookup the passed asset-id in the asset data, and return the asset-id, issuer,
@@ -832,5 +851,20 @@ bool show_mweb_output_activity(
     JADE_ASSERT(network_is_litecoin(network));
 
     return show_input_output_activity(title, false, true, address, amount, network_ticker(network), NULL, NULL, NULL);
+}
+
+// Pegin: transparent LTC being pegged IN to MWEB. Not an outbound
+// destination, so render with is_address=false so the UI labels the
+// description field appropriately instead of prefixing "To Address:".
+bool show_mweb_pegin_activity(const uint64_t amount, const network_t network)
+{
+    JADE_ASSERT(network_is_litecoin(network));
+
+    char amount_str[32];
+    const int ret = snprintf(amount_str, sizeof(amount_str), "%.08f", 1.0 * amount / 1e8);
+    JADE_ASSERT(ret > 0 && ret < sizeof(amount_str));
+
+    return show_input_output_activity(
+        "MWEB Pegin", false, false, "Transparent -> MWEB", amount_str, network_ticker(network), NULL, NULL, NULL);
 }
 #endif // AMALGAMATED_BUILD
