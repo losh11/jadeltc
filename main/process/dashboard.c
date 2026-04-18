@@ -17,6 +17,7 @@
 #include "../serial.h"
 #include "../storage.h"
 #include "../ui.h"
+#include "../mweb/mweb_selfcheck.h"
 #include "../utils/cbor_rpc.h"
 #include "../utils/event.h"
 #include "../utils/malloc_ext.h"
@@ -531,6 +532,32 @@ static void dispatch_message(jade_process_t* process)
         } else {
             jade_process_reject_message(process, CBOR_RPC_INTERNAL_ERROR, "ERROR");
         }
+    } else if (IS_METHOD("debug_selfcheck_mweb")) {
+        // MWEB-only subset of debug_selfcheck. Runs every sub-test (does
+        // NOT abort on first failure) and returns per-test name / passed
+        // / elapsed_ms so the caller can see exactly which checks ran
+        // and which regressed — "ms only" wasn't enough signal to tell
+        // whether new tests were actually executing.
+        static mweb_test_result_t results[MWEB_SELFCHECK_MAX_TESTS];
+        const TickType_t start_time = xTaskGetTickCount();
+        const size_t n_results
+            = test_mweb_crypto_run_all(results, MWEB_SELFCHECK_MAX_TESTS);
+        const uint64_t elapsed_time_ms
+            = (xTaskGetTickCount() - start_time) * portTICK_PERIOD_MS;
+
+        struct mweb_selfcheck_reply_ctx reply = {
+            .results = results,
+            .n_results = n_results,
+            .elapsed_time_ms = elapsed_time_ms,
+        };
+
+        /* Buffer is sized from MWEB_SELFCHECK_MAX_TESTS in the shared
+         * header so growing the test count also grows the buffer and
+         * the CBOR encoder can't hit CborErrorOutOfMemory at the
+         * advertised max. */
+        uint8_t buf[MWEB_SELFCHECK_REPLY_BUF_BYTES];
+        jade_process_reply_to_message_result(
+            process->ctx, buf, sizeof(buf), &reply, mweb_selfcheck_reply_cb);
     } else if (IS_METHOD("debug_clean_reset")) {
         task_function = debug_clean_reset_process;
     } else if (IS_METHOD("debug_set_mnemonic")) {

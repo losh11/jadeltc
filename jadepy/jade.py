@@ -653,6 +653,21 @@ class JadeAPI:
         """
         return self._jadeRpc('debug_selfcheck', long_timeout=True)
 
+    def run_remote_selfcheck_mweb(self):
+        """
+        RPC call to run only the MWEB crypto selfcheck vectors.
+        NOTE: Only available in a DEBUG build of the firmware.
+
+        Returns
+        -------
+        dict
+            { 'elapsed_ms': int,
+              'results':    [ { 'name': str,
+                                'passed': bool,
+                                'elapsed_ms': int }, ... ] }
+        """
+        return self._jadeRpc('debug_selfcheck_mweb', long_timeout=True)
+
     def run_remote_gcov_dump(self):
         """
         RPC call to run in-built gcov-dump.

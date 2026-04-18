@@ -917,11 +917,20 @@ mweb_err_t mweb_session_begin(
         if (!s->outputs) { err = MWEB_ERR_INTERNAL; goto fail; }
     }
 
-    uint8_t wallet_fp_be[4];
-    wallet_get_fingerprint(wallet_fp_be, sizeof(wallet_fp_be));
-    uint8_t wallet_fp_le[4] = {
-        wallet_fp_be[3], wallet_fp_be[2], wallet_fp_be[1], wallet_fp_be[0]
-    };
+    /* Wallet fingerprint is only needed when there's at least one MWEB
+     * input to compare against; skip the call entirely for kernel-only
+     * or standard-to-MWEB PSBTs so session_begin doesn't ASSERT when
+     * the wallet isn't initialised (debug_selfcheck_mweb on a fresh
+     * boot, etc.). */
+    uint8_t wallet_fp_le[4] = {0};
+    if (n_mweb_inputs_seen > 0) {
+        uint8_t wallet_fp_be[4];
+        wallet_get_fingerprint(wallet_fp_be, sizeof(wallet_fp_be));
+        wallet_fp_le[0] = wallet_fp_be[3];
+        wallet_fp_le[1] = wallet_fp_be[2];
+        wallet_fp_le[2] = wallet_fp_be[1];
+        wallet_fp_le[3] = wallet_fp_be[0];
+    }
 
     /* Per-owned-input state + input-commit check. */
     for (size_t i = 0; i < psbt->num_inputs; i++) {

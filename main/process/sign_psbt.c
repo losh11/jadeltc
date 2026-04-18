@@ -29,6 +29,7 @@
 
 #ifdef BUILD_MWEB
 #include "../mweb/mweb_atomic_sign.h"
+#include "../mweb/mweb_gate.h"
 #include "../mweb/mweb_keychain.h"
 #include "../mweb/mweb_sign.h"
 #include "../utils/address.h"
@@ -1210,16 +1211,7 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
         // (zero MWEB inputs, one MWEB output, one kernel) still enters
         // the bind-then-sign pass.
         {
-            bool has_mweb = mweb_input_count > 0 || psbt->num_mweb_kernels > 0;
-            if (!has_mweb) {
-                for (size_t i = 0; i < psbt->num_outputs; ++i) {
-                    if (MWEB_OUT_IS_MWEB(psbt->outputs[i].mweb_output_keyset)) {
-                        has_mweb = true;
-                        break;
-                    }
-                }
-            }
-            if (has_mweb) {
+            if (sign_psbt_has_mweb_component(psbt)) {
                 mweb_err_t merr = mweb_session_begin(psbt, network_id, &mweb_session);
                 if (merr != MWEB_OK) {
                     *errmsg = mweb_err_to_string(merr);
