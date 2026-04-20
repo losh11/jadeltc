@@ -1474,6 +1474,16 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
             retval = CBOR_RPC_INTERNAL_ERROR;
             goto cleanup;
         }
+
+        // S8: strip the presign proprietary fields so the returned
+        // PSBT is broadcast-ready. Clears 0xFC "JADE" 0x01 on every
+        // output and 0xFC "JADE" 0x02 on every kernel. Success path
+        // only; prior failure paths already rolled the PSBT back.
+        if (wally_psbt_strip_mweb_presign_fields(psbt) != WALLY_OK) {
+            *errmsg = "Failed to strip MWEB presign fields";
+            retval = CBOR_RPC_INTERNAL_ERROR;
+            goto cleanup;
+        }
     }
 #endif /* BUILD_MWEB */
 
