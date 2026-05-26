@@ -65,7 +65,7 @@ struct mweb_derived_output {
  *   out          — populated on MWEB_OK; zeroed on failure
  *
  * Failure modes:
- *   MWEB_ERR_INVALID_PRESIGN_SCALAR — sender_key fails validation
+ *   MWEB_ERR_INVALID_SCALAR — sender_key fails validation
  *   MWEB_ERR_INTERNAL                — null argument, secp256k1 operation
  *                                      failed (unreachable for well-formed
  *                                      inputs), or BLAKE3/Pedersen primitive
@@ -92,7 +92,7 @@ mweb_err_t mweb_derive_output(
  * deterministic proof.
  *
  * Failure modes:
- *   MWEB_ERR_INVALID_PRESIGN_SCALAR — sender_key fails validation
+ *   MWEB_ERR_INVALID_SCALAR — sender_key fails validation
  *   MWEB_ERR_INTERNAL                — null argument, extra_data_len above
  *                                      MWEB_OUTPUT_MAX_EXTRA_DATA_LEN,
  *                                      extra_data bytes supplied without

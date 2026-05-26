@@ -66,7 +66,7 @@ typedef struct {
  * compressed `key_exchange_pubkey` from the PSBT input's 0x99 field.
  *
  * Failure modes:
- *   MWEB_ERR_INVALID_PRESIGN_SCALAR  — features lacks STEALTH_KEY_BIT, or
+ *   MWEB_ERR_INVALID_SCALAR  — features lacks STEALTH_KEY_BIT, or
  *                                      the ephemeral TRNG draw produced a
  *                                      non-canonical scalar after 8 retries.
  *   MWEB_ERR_FOREIGN_MWEB_INPUT      — output-key verification fails.

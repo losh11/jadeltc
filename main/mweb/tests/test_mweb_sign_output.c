@@ -276,7 +276,7 @@ static void test_each_input_in_sig_hash(void)
 }
 
 /*
- * Invalid sender_key → MWEB_ERR_INVALID_PRESIGN_SCALAR.
+ * Invalid sender_key → MWEB_ERR_INVALID_SCALAR.
  */
 static void test_zero_sender_key_rejected(void)
 {
@@ -287,7 +287,7 @@ static void test_zero_sender_key_rejected(void)
         FAIL("zero_sender_key_rejected", "accepted zero sender_key");
         return;
     }
-    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+    if (err != MWEB_ERR_INVALID_SCALAR) {
         FAIL("zero_sender_key_rejected", "wrong err code: %d", (int)err);
         return;
     }
@@ -308,7 +308,7 @@ static void test_overflow_sender_key_rejected(void)
         FAIL("overflow_sender_key_rejected", "accepted n-as-sender_key");
         return;
     }
-    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+    if (err != MWEB_ERR_INVALID_SCALAR) {
         FAIL("overflow_sender_key_rejected", "wrong err code: %d", (int)err);
         return;
     }

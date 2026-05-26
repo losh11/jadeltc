@@ -39,7 +39,7 @@ bool mweb_schnorr_sign(const uint8_t secret_key[32],
  * is BLAKE3(MwebOutputMessage); rp_hash is BLAKE3(rangeproof). The
  * order matches MwebOutput.sig_hash() in ltcsuite.
  *
- * Returns MWEB_ERR_INVALID_PRESIGN_SCALAR if sender_key fails scalar
+ * Returns MWEB_ERR_INVALID_SCALAR if sender_key fails scalar
  * validation; MWEB_ERR_INTERNAL on signing failure or NULL inputs.
  */
 mweb_err_t mweb_sign_output(

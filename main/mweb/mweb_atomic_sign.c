@@ -57,9 +57,13 @@
  */
 #define MWEB_OUT_STEALTH_ADDRESS_KEY  0x90
 #define MWEB_OUT_COMMIT_KEY           0x91
+#define MWEB_OUT_FEATURES_KEY         0x92
 #define MWEB_OUT_SENDER_PUBKEY_KEY    0x93
 #define MWEB_OUT_OUTPUT_PUBKEY_KEY    0x94
 #define MWEB_OUT_STANDARD_FIELDS_KEY  0x95
+#define MWEB_OUT_RANGE_PROOF_KEY      0x96
+#define MWEB_OUT_SIGNATURE_KEY        0x97
+#define MWEB_OUT_EXTRA_DATA_KEY       0x98
 
 #define MWEB_IN_SPENT_OUTPUT_ID_KEY      0x90
 #define MWEB_IN_SPENT_OUTPUT_COMMIT_KEY  0x91
@@ -99,10 +103,37 @@ typedef struct {
     uint8_t  prev_input_pubkey[33];
 } session_input_t;
 
+/*
+ * Per-output build state. The device draws senderKey from TRNG, derives
+ * blind, and produces every byte that lands in the PSBT output: commit,
+ * pubkeys, standard fields, range proof, signature. These bytes are
+ * staged in the session arena and written into psbt->outputs[].unknowns
+ * during mweb_session_commit.
+ *
+ * senderKey + blind are also folded into the kernel offsets
+ * (Sum(r_out_j) and Sum(senderKey_j)) so a stale or hostile
+ * psbt->mweb_tx_offset / psbt->mweb_stealth_offset is silently overridden.
+ *
+ * sender_key and blind never leave this struct; session_free() bzero's
+ * the whole array before free.
+ */
 typedef struct {
     size_t   psbt_index;
     uint64_t value;
-    uint8_t  blind[32];
+    uint8_t  features;
+
+    uint8_t  blind[32];                /* r_out — kernel offset accumulation */
+    uint8_t  sender_key[32];           /* senderKey — stealth offset accumulation */
+
+    uint8_t  commit[33];                          /* PSBT 0x91 */
+    uint8_t  sender_pubkey[33];                   /* PSBT 0x93 */
+    uint8_t  output_pubkey[33];                   /* PSBT 0x94 */
+    /* PSBT 0x95: K_e(33) || view_tag(1) || masked_value(8 LE) || masked_nonce(16 BE).
+     * Stored in on-wire byte order so commit can copy it verbatim into
+     * po->mweb_standard_fields without reassembly. */
+    uint8_t  standard_fields[58];
+    uint8_t  range_proof[MWEB_RANGEPROOF_LEN];    /* PSBT 0x96 */
+    uint8_t  signature[64];                       /* PSBT 0x97 */
 } session_output_t;
 
 typedef struct {
@@ -180,22 +211,26 @@ typedef struct {
 /*
  * Per-output rollback snapshot.
  *
- * Captures the state that `mweb_session_abort` must restore on a
- * per-output basis to keep the PSBT byte-identical to its begin-entry
- * state:
- *   - `unknowns` — the entire wally_map, deep-cloned. Any keys
- *     inserted or replaced between begin and abort are unwound by
- *     the pointer-swap restore, regardless of which proprietary
- *     keys are touched.
- *   - `mweb_output_keyset` — the duplicate-tracking bitset, copied
- *     wholesale. Restored to its begin-entry value so the bitset
- *     stays consistent with the map contents after the swap.
+ * Captures begin-entry state for every byte that mweb_session_commit
+ * may overwrite on an MWEB output:
+ *   - `unknowns` — the entire wally_map, deep-cloned. Restores any
+ *     non-MWEB unknowns the host attached that the standard signing
+ *     loop or commit might have drifted.
+ *   - `mweb_output_keyset` — duplicate-tracking bitset, copied wholesale.
+ *   - Fixed-size first-class MWEB output struct fields (commit, features,
+ *     sender_pubkey, output_pubkey, standard_fields, signature) —
+ *     memcpy-back on restore.
+ *   - `mweb_range_proof` — heap-owned, deep-copied at snapshot time so
+ *     commit can free + replace `po->mweb_range_proof` without
+ *     affecting the snapshot's copy. On restore the snapshot's
+ *     pointer is transferred back to `po` (ownership moves); if the
+ *     snapshot held NULL (typical unsigned-PSBT shape), restore just
+ *     frees whatever commit allocated and leaves po->mweb_range_proof
+ *     = NULL.
  *
  * `unknowns.valid` gates the composite as a whole: if the map clone
- * fails we leave both fields untouched at restore time so a partially-
- * captured snapshot cannot truncate a live map. The keyset copy has
- * no failure mode of its own, so a separate composite flag would just
- * shadow `unknowns.valid` without adding information.
+ * fails we leave the live output untouched at restore time so a
+ * partially-captured snapshot cannot truncate live state.
  *
  * One slot per `psbt->outputs[]` index so the abort path can address by
  * raw output index regardless of which outputs are MWEB-shaped.
@@ -203,6 +238,14 @@ typedef struct {
 typedef struct {
     wally_map_snapshot_t unknowns;
     uint16_t             mweb_output_keyset;
+    uint8_t              mweb_commit[33];
+    uint8_t              mweb_features;
+    uint8_t              mweb_sender_pubkey[33];
+    uint8_t              mweb_output_pubkey[33];
+    uint8_t              mweb_standard_fields[58];
+    uint8_t              mweb_signature[64];
+    unsigned char       *mweb_range_proof;
+    size_t               mweb_range_proof_len;
 } mweb_output_snapshot_t;
 
 struct mweb_session {
@@ -343,15 +386,6 @@ static bool atomic_parse_pegout(const uint8_t *val, size_t val_len,
     *script_out = p + hdr;
     *script_len_out = (size_t)slen;
     return true;
-}
-
-static const struct wally_map_item *find_unknown(const struct wally_map *m, uint8_t key)
-{
-    size_t found = 0;
-    if (wally_map_find(m, &key, 1, &found) != WALLY_OK || found == 0) {
-        return NULL;
-    }
-    return &m->items[found - 1];
 }
 
 /* ── Snapshot / rollback ──────────────────────────────────────────────── */
@@ -558,16 +592,23 @@ static void free_mweb_output_snapshot(mweb_output_snapshot_t *snap)
 {
     if (!snap) return;
     free_wally_map_snapshot(&snap->unknowns);
+    if (snap->mweb_range_proof) {
+        wally_bzero(snap->mweb_range_proof, snap->mweb_range_proof_len);
+        wally_free(snap->mweb_range_proof);
+    }
     memset(snap, 0, sizeof(*snap));
 }
 
 /*
- * Clone an output's `unknowns` map and record its `mweb_output_keyset`.
- * Returns false on OOM during the clone; in that case
- * `snap->unknowns.valid` is left false and restore is a no-op. The
- * keyset is copied unconditionally — it's only meaningful when the
- * paired map clone succeeded, and `restore_mweb_output` gates on
- * `unknowns.valid` before reading it.
+ * Capture begin-entry state for one MWEB output. Clones the `unknowns`
+ * map (existing pre-allocate pattern), copies fixed-size struct fields,
+ * deep-copies any heap-owned `mweb_range_proof`. Returns false on OOM
+ * — partial state is freed before return so `restore_mweb_output`
+ * sees `unknowns.valid == false` and leaves the live output alone.
+ *
+ * The keyset bitset is copied unconditionally; it's only meaningful
+ * when the paired map clone succeeded, and `restore_mweb_output` gates
+ * on `unknowns.valid` before reading any snapshot field.
  */
 static bool snapshot_mweb_output(mweb_output_snapshot_t *snap,
                                   const struct wally_psbt_output *po)
@@ -579,19 +620,63 @@ static bool snapshot_mweb_output(mweb_output_snapshot_t *snap,
         return false;
     }
     snap->mweb_output_keyset = po->mweb_output_keyset;
+    memcpy(snap->mweb_commit,          po->mweb_commit,          33);
+    snap->mweb_features = po->mweb_features;
+    memcpy(snap->mweb_sender_pubkey,   po->mweb_sender_pubkey,   33);
+    memcpy(snap->mweb_output_pubkey,   po->mweb_output_pubkey,   33);
+    memcpy(snap->mweb_standard_fields, po->mweb_standard_fields, 58);
+    memcpy(snap->mweb_signature,       po->mweb_signature,       64);
+
+    /* Deep-copy any host-supplied range_proof so commit can free +
+     * replace po->mweb_range_proof without aliasing the snapshot.
+     * Typical unsigned-PSBT shape has po->mweb_range_proof == NULL so
+     * this branch is skipped. */
+    if (po->mweb_range_proof && po->mweb_range_proof_len) {
+        snap->mweb_range_proof = wally_malloc(po->mweb_range_proof_len);
+        if (!snap->mweb_range_proof) {
+            free_wally_map_snapshot(&snap->unknowns);
+            memset(snap, 0, sizeof(*snap));
+            return false;
+        }
+        memcpy(snap->mweb_range_proof, po->mweb_range_proof,
+               po->mweb_range_proof_len);
+        snap->mweb_range_proof_len = po->mweb_range_proof_len;
+    }
     return true;
 }
 
 /*
- * Swap the cloned `unknowns` back into place and restore the
- * begin-entry `mweb_output_keyset`. No-op if the snapshot was never
- * captured (e.g. begin failed before the array was populated) so a
- * half-built snapshot array cannot clobber live state.
+ * Roll one MWEB output back to its begin-entry state. Frees any
+ * `mweb_range_proof` commit allocated (or the host supplied that we
+ * then overwrote) and transfers the snapshot's copy back. No-op if
+ * the snapshot was never captured (begin failed before this slot
+ * was populated) so a half-built snapshot array cannot clobber live
+ * state.
  */
 static void restore_mweb_output(mweb_output_snapshot_t *snap,
                                  struct wally_psbt_output *po)
 {
     if (!snap || !po || !snap->unknowns.valid) return;
+
+    memcpy(po->mweb_commit,          snap->mweb_commit,          33);
+    po->mweb_features = snap->mweb_features;
+    memcpy(po->mweb_sender_pubkey,   snap->mweb_sender_pubkey,   33);
+    memcpy(po->mweb_output_pubkey,   snap->mweb_output_pubkey,   33);
+    memcpy(po->mweb_standard_fields, snap->mweb_standard_fields, 58);
+    memcpy(po->mweb_signature,       snap->mweb_signature,       64);
+
+    /* Free commit's allocation (if any); transfer snapshot's begin-entry
+     * pointer to po. Snapshot's pointer is cleared so the next
+     * free_mweb_output_snapshot doesn't double-free. */
+    if (po->mweb_range_proof) {
+        wally_bzero(po->mweb_range_proof, po->mweb_range_proof_len);
+        wally_free(po->mweb_range_proof);
+    }
+    po->mweb_range_proof = snap->mweb_range_proof;
+    po->mweb_range_proof_len = snap->mweb_range_proof_len;
+    snap->mweb_range_proof = NULL;
+    snap->mweb_range_proof_len = 0;
+
     po->mweb_output_keyset = snap->mweb_output_keyset;
     restore_wally_map(&snap->unknowns, &po->unknowns);
 }
@@ -783,85 +868,128 @@ static mweb_err_t derive_owned_input(const struct wally_psbt *psbt,
     return MWEB_OK;
 }
 
-/* ── Per-output recipient binding ──────────────────────────────────── */
+/* ── Per-output build ──────────────────────────────────────────────── */
 
-static mweb_err_t verify_mweb_output(const struct wally_psbt_output *po,
-                                      size_t i, session_output_t *out)
+/*
+ * Build one MWEB output from the host-supplied stealth address +
+ * amount (+ optional 0x92 features, 0x98 extra_data). Generates the
+ * senderKey on the device, runs the recipient-binding derivation, the
+ * bulletproof rangeproof, and the per-output Schnorr signature, and
+ * stages every byte that will be written to psbt->outputs[i].unknowns
+ * during commit.
+ *
+ * The PSBT itself is not mutated here — atomic_sign keeps the
+ * "begin builds, commit writes" invariant so a downstream failure
+ * (kernel sign, balance check, user cancel) leaves the PSBT
+ * byte-identical to begin-entry via mweb_session_abort.
+ */
+static mweb_err_t build_mweb_output(const struct wally_psbt_output *po,
+                                     size_t i, session_output_t *out)
 {
     if (!po->has_amount) {
         return MWEB_ERR_OUTPUT_FIELD_MISMATCH;
     }
     uint64_t value = (uint64_t)po->amount;
 
+    if (!(po->mweb_output_keyset & MWEB_OUT_BIT(MWEB_OUT_STEALTH_ADDRESS_KEY))) {
+        return MWEB_ERR_OUTPUT_FIELD_MISMATCH;
+    }
+    const uint8_t *scan_pub_A  = po->mweb_stealth_address;
+    const uint8_t *spend_pub_B = po->mweb_stealth_address + 33;
+
+    /* Features default to STANDARD_FIELDS_BIT — every MWEB output the
+     * device emits on chain carries the standard section (K_e, view_tag,
+     * masked_v, masked_n). The host may override with 0x92 to add the
+     * EXTRA_DATA bit. */
+    uint8_t features = MWEB_OUTPUT_STANDARD_FIELDS_BIT;
+    if (po->mweb_output_keyset & MWEB_OUT_BIT(MWEB_OUT_FEATURES_KEY)) {
+        features = po->mweb_features;
+    }
+
+    /* extra_data presence must match the feature bit so the rangeproof
+     * extra_commit and on-chain serialization stay in sync. */
+    const uint8_t *extra_data = NULL;
+    size_t extra_data_len = 0;
+    if (po->mweb_output_keyset & MWEB_OUT_BIT(MWEB_OUT_EXTRA_DATA_KEY)) {
+        if (!(features & MWEB_OUTPUT_EXTRA_DATA_BIT)
+            || po->mweb_extra_data_len > MWEB_OUTPUT_MAX_EXTRA_DATA_LEN) {
+            return MWEB_ERR_OUTPUT_FIELD_MISMATCH;
+        }
+        extra_data = po->mweb_extra_data;
+        extra_data_len = po->mweb_extra_data_len;
+    } else if (features & MWEB_OUTPUT_EXTRA_DATA_BIT) {
+        return MWEB_ERR_OUTPUT_FIELD_MISMATCH;
+    }
+
     uint8_t sender_key[32];
-    size_t  written = 0;
-    if (wally_psbt_output_get_mweb_presign_sender_key(po,
-            sender_key, sizeof(sender_key), &written) != WALLY_OK
-        || written != 32) {
-        return MWEB_ERR_MISSING_SENDER_KEY;
+#ifndef AMALGAMATED_BUILD
+    SENSITIVE_PUSH(sender_key, sizeof(sender_key));
+#endif
+    /* TRNG draw with an 8-retry budget against mweb_validate_scalar
+     * (rejects zero and >= curve order n). The rejection band is roughly
+     * 2^128 of 2^256, so eight consecutive out-of-range draws on a
+     * healthy TRNG is vanishingly unlikely — exhaustion is treated as a
+     * hardware fault and surfaced as INTERNAL. Mirrors e_k / stealth_key
+     * elsewhere in mweb_kernel.c / mweb_atomic_sign.c. */
+    bool got_sender_key = false;
+    for (int tries = 0; tries < 8; ++tries) {
+        get_random(sender_key, sizeof(sender_key));
+        if (mweb_validate_scalar(sender_key)) {
+            got_sender_key = true;
+            break;
+        }
     }
-    if (!mweb_validate_scalar(sender_key)) {
-        wally_bzero(sender_key, 32);
-        return MWEB_ERR_INVALID_PRESIGN_SCALAR;
-    }
-
-    const struct wally_map_item *sa = find_unknown(&po->unknowns,
-        MWEB_OUT_STEALTH_ADDRESS_KEY);
-    if (!sa || sa->value_len != 66) {
-        wally_bzero(sender_key, 32);
-        return MWEB_ERR_OUTPUT_FIELD_MISMATCH;
-    }
-    const uint8_t *A = sa->value;
-    const uint8_t *B = sa->value + 33;
-
-    const struct wally_map_item *cm = find_unknown(&po->unknowns,
-        MWEB_OUT_COMMIT_KEY);
-    const struct wally_map_item *sp = find_unknown(&po->unknowns,
-        MWEB_OUT_SENDER_PUBKEY_KEY);
-    const struct wally_map_item *op = find_unknown(&po->unknowns,
-        MWEB_OUT_OUTPUT_PUBKEY_KEY);
-    const struct wally_map_item *sf = find_unknown(&po->unknowns,
-        MWEB_OUT_STANDARD_FIELDS_KEY);
-    if (!cm || cm->value_len != 33
-        || !sp || sp->value_len != 33
-        || !op || op->value_len != 33
-        || !sf || sf->value_len != 58) {
-        wally_bzero(sender_key, 32);
-        return MWEB_ERR_OUTPUT_FIELD_MISMATCH;
+    if (!got_sender_key) {
+        wally_bzero(sender_key, sizeof(sender_key));
+#ifndef AMALGAMATED_BUILD
+        SENSITIVE_POP(sender_key);
+#endif
+        return MWEB_ERR_INTERNAL;
     }
 
-    /* 0x95: Ke[33] || viewTag[1] || maskedValue[8 LE] || maskedNonce[16 BE] */
-    const uint8_t *sf_ke = sf->value;
-    uint8_t  sf_view_tag = sf->value[33];
-    uint64_t sf_masked_value = 0;
-    for (int k = 0; k < 8; k++) {
-        sf_masked_value |= ((uint64_t)sf->value[34 + k]) << (k * 8);
-    }
-    const uint8_t *sf_masked_nonce = sf->value + 42;
-
-    struct mweb_derived_output derived;
-    mweb_err_t err = mweb_derive_output(sender_key, A, B, value, &derived);
-    wally_bzero(sender_key, 32);
+    struct mweb_built_output built;
+    memset(&built, 0, sizeof(built));
+    mweb_err_t err = mweb_build_output(
+        sender_key, scan_pub_A, spend_pub_B,
+        value, features, extra_data, extra_data_len, &built);
     if (err != MWEB_OK) {
-        wally_bzero(&derived, sizeof(derived));
-        return err;
-    }
-
-    if (memcmp(cm->value, derived.commit,              33) != 0
-        || memcmp(sp->value, derived.sender_pubkey,       33) != 0
-        || memcmp(op->value, derived.output_pubkey,       33) != 0
-        || memcmp(sf_ke,     derived.key_exchange_pubkey, 33) != 0
-        || sf_view_tag       != derived.view_tag
-        || sf_masked_value   != derived.masked_value
-        || memcmp(sf_masked_nonce, derived.masked_nonce, 16) != 0) {
-        wally_bzero(&derived, sizeof(derived));
-        return MWEB_ERR_OUTPUT_FIELD_MISMATCH;
+        wally_bzero(sender_key, sizeof(sender_key));
+        wally_bzero(&built, sizeof(built));
+#ifndef AMALGAMATED_BUILD
+        SENSITIVE_POP(sender_key);
+#endif
+        /* Every failure mode inside mweb_build_output (validated inputs,
+         * capped extra_data) is an internal device fault from this
+         * caller's vantage point — fold them all to INTERNAL. */
+        return MWEB_ERR_INTERNAL;
     }
 
     out->psbt_index = i;
     out->value      = value;
-    memcpy(out->blind, derived.blind, 32);
-    wally_bzero(&derived, sizeof(derived));
+    out->features   = features;
+    memcpy(out->sender_key,    sender_key,           32);
+    memcpy(out->blind,         built.blind,          32);
+    memcpy(out->commit,        built.commit,         33);
+    memcpy(out->sender_pubkey, built.sender_pubkey,  33);
+    memcpy(out->output_pubkey, built.output_pubkey,  33);
+
+    /* Pack the standard_fields blob in on-wire layout once here so
+     * commit can memcpy it verbatim into the PSBT struct slot. */
+    memcpy(out->standard_fields,      built.key_exchange_pubkey, 33);
+    out->standard_fields[33] = built.view_tag;
+    for (int b = 0; b < 8; b++) {
+        out->standard_fields[34 + b] = (uint8_t)(built.masked_value >> (b * 8));
+    }
+    memcpy(out->standard_fields + 42, built.masked_nonce,        16);
+
+    memcpy(out->range_proof, built.range_proof, MWEB_RANGEPROOF_LEN);
+    memcpy(out->signature,   built.signature,   64);
+
+    wally_bzero(sender_key, sizeof(sender_key));
+    wally_bzero(&built, sizeof(built));
+#ifndef AMALGAMATED_BUILD
+    SENSITIVE_POP(sender_key);
+#endif
     return MWEB_OK;
 }
 
@@ -951,6 +1079,12 @@ mweb_err_t mweb_session_begin(
 
     mweb_err_t err = MWEB_ERR_INTERNAL;
 
+    /* Declared up here (before any goto fail) so the fail label's
+     * SENSITIVE_POP guard can read `has_stealth_key` regardless of which
+     * branch jumped to fail. */
+    uint8_t  stealth_key[32] = {0};
+    bool     has_stealth_key = false;
+
     /*
      * Reject kernels that omit the features byte. The wire encoding
      * writes `features` unconditionally, so a PSBT with !has_features
@@ -965,8 +1099,6 @@ mweb_err_t mweb_session_begin(
     }
 
     uint8_t  features      = kernel->features;
-    uint8_t  stealth_key[32] = {0};
-    bool     has_stealth_key = false;
 
     /* Feature bit ↔ field presence (libwally `has_*` flags). */
     const bool fee_bit    = (features & MWEB_KERNEL_FEE_BIT) != 0;
@@ -1103,36 +1235,43 @@ mweb_err_t mweb_session_begin(
         wally_bzero(&si, sizeof(si));
     }
 
-    /* Recipient-binding verification for every MWEB output. */
+    /* Per-output build (TRNG senderKey, recipient-binding derivation,
+     * bulletproof rangeproof, output signature). Bytes are staged in
+     * the session arena; the PSBT itself is not mutated until
+     * mweb_session_commit. */
     for (size_t i = 0; i < psbt->num_outputs; i++) {
         const struct wally_psbt_output *po = &psbt->outputs[i];
         if (!MWEB_OUT_IS_MWEB(po->mweb_output_keyset)) {
             continue;
         }
 
-        session_output_t so;
-        memset(&so, 0, sizeof(so));
-        mweb_err_t oe = verify_mweb_output(po, i, &so);
+        /* Build directly into the heap-allocated session slot to avoid
+         * a ~900 B stack temporary during bulletproof generation.
+         * On failure we wipe the slot and goto fail without bumping
+         * n_outputs, so the slot is treated as unused. session_free
+         * blanket-bzero's the whole array on teardown either way. */
+        session_output_t *so = &s->outputs[s->n_outputs];
+        memset(so, 0, sizeof(*so));
+        mweb_err_t oe = build_mweb_output(po, i, so);
         if (oe != MWEB_OK) {
-            wally_bzero(&so, sizeof(so));
+            wally_bzero(so, sizeof(*so));
             err = oe;
             goto fail;
         }
-        if (!atomic_in_money_range(so.value)) {
-            wally_bzero(&so, sizeof(so));
+        if (!atomic_in_money_range(so->value)) {
+            wally_bzero(so, sizeof(*so));
             err = MWEB_ERR_BALANCE_FAIL;
             goto fail;
         }
-        if (!atomic_u64_add(s->total_output_value, so.value,
+        if (!atomic_u64_add(s->total_output_value, so->value,
                 &s->total_output_value)
             || !atomic_in_money_range(s->total_output_value)) {
-            wally_bzero(&so, sizeof(so));
+            wally_bzero(so, sizeof(*so));
             err = MWEB_ERR_BALANCE_FAIL;
             goto fail;
         }
 
-        s->outputs[s->n_outputs++] = so;
-        wally_bzero(&so, sizeof(so));
+        s->n_outputs++;
     }
 
     /* Kernel totals + pegout table. */
@@ -1235,13 +1374,32 @@ mweb_err_t mweb_session_begin(
             }
         }
 
+        /* received_tx_offset / received_stealth_offset are the
+         * output-side contribution to the kernel offsets:
+         *     received_tx_offset      = Sum_j r_out_j
+         *     received_stealth_offset = Sum_j senderKey_j
+         * Both are derived from session-arena scalars produced on the
+         * device, so a stale or hostile psbt->mweb_tx_offset /
+         * psbt->mweb_stealth_offset cannot influence the kernel signature.
+         * The host-supplied globals are overwritten in commit. */
         uint8_t received_tx_offset[32]      = {0};
         uint8_t received_stealth_offset[32] = {0};
-        if (psbt->has_mweb_tx_offset) {
-            memcpy(received_tx_offset, psbt->mweb_tx_offset, 32);
+        bool offset_ok = true;
+        for (size_t j = 0; j < s->n_outputs && offset_ok; j++) {
+            if (!mweb_scalar_add_mod_n(received_tx_offset,
+                    s->outputs[j].blind, received_tx_offset)
+                || !mweb_scalar_add_mod_n(received_stealth_offset,
+                    s->outputs[j].sender_key, received_stealth_offset)) {
+                offset_ok = false;
+            }
         }
-        if (psbt->has_mweb_stealth_offset) {
-            memcpy(received_stealth_offset, psbt->mweb_stealth_offset, 32);
+        if (!offset_ok) {
+            if (in_ctx)  { wally_bzero(in_ctx, sizeof(*in_ctx) * s->n_inputs); free(in_ctx); }
+            if (out_ctx) { wally_bzero(out_ctx, sizeof(*out_ctx) * s->n_outputs); free(out_ctx); }
+            wally_bzero(received_tx_offset, 32);
+            wally_bzero(received_stealth_offset, 32);
+            err = MWEB_ERR_OFFSET_ACCUMULATE_FAIL;
+            goto fail;
         }
 
         kp.inputs                  = in_ctx;
@@ -1373,6 +1531,56 @@ mweb_err_t mweb_session_commit(mweb_session_t *s, struct wally_psbt *psbt)
         }
     }
 
+    /* Write every MWEB output's built fields into the PSBT via the
+     * first-class struct slots on wally_psbt_output. The range proof
+     * needs a heap-owned buffer; everything else is a fixed-size
+     * memcpy + a keyset bit OR. If wally_malloc fails we abort —
+     * the per-output snapshot taken at session_begin restores
+     * byte-identical state including freeing the partial allocation. */
+    for (size_t j = 0; j < s->n_outputs; j++) {
+        session_output_t *so = &s->outputs[j];
+        if (so->psbt_index >= psbt->num_outputs) {
+            mweb_session_abort(s, psbt);
+            return MWEB_ERR_INTERNAL;
+        }
+        struct wally_psbt_output *po = &psbt->outputs[so->psbt_index];
+
+        /* Allocate the range_proof buffer first — only failable step in
+         * this write loop. */
+        unsigned char *rp_buf = wally_malloc(MWEB_RANGEPROOF_LEN);
+        if (!rp_buf) {
+            mweb_session_abort(s, psbt);
+            return MWEB_ERR_INTERNAL;
+        }
+        memcpy(rp_buf, so->range_proof, MWEB_RANGEPROOF_LEN);
+
+        /* If the host pre-populated a range_proof, free it before
+         * replacing — leaks otherwise. Snapshot already owns its own
+         * deep-copy so this free doesn't disturb rollback. */
+        if (po->mweb_range_proof) {
+            wally_bzero(po->mweb_range_proof, po->mweb_range_proof_len);
+            wally_free(po->mweb_range_proof);
+        }
+        po->mweb_range_proof = rp_buf;
+        po->mweb_range_proof_len = MWEB_RANGEPROOF_LEN;
+
+        memcpy(po->mweb_commit,          so->commit,          33);
+        po->mweb_features = so->features;
+        memcpy(po->mweb_sender_pubkey,   so->sender_pubkey,   33);
+        memcpy(po->mweb_output_pubkey,   so->output_pubkey,   33);
+        memcpy(po->mweb_standard_fields, so->standard_fields, 58);
+        memcpy(po->mweb_signature,       so->signature,       64);
+
+        po->mweb_output_keyset |=
+              MWEB_OUT_BIT(MWEB_OUT_COMMIT_KEY)
+            | MWEB_OUT_BIT(MWEB_OUT_FEATURES_KEY)
+            | MWEB_OUT_BIT(MWEB_OUT_SENDER_PUBKEY_KEY)
+            | MWEB_OUT_BIT(MWEB_OUT_OUTPUT_PUBKEY_KEY)
+            | MWEB_OUT_BIT(MWEB_OUT_STANDARD_FIELDS_KEY)
+            | MWEB_OUT_BIT(MWEB_OUT_RANGE_PROOF_KEY)
+            | MWEB_OUT_BIT(MWEB_OUT_SIGNATURE_KEY);
+    }
+
     /* Emit MWEB input signatures via Stage B. */
     for (size_t i = 0; i < s->n_inputs; i++) {
         session_input_t *si = &s->inputs[i];
@@ -1433,10 +1641,9 @@ const char *mweb_err_to_string(mweb_err_t err)
 {
     switch (err) {
     case MWEB_OK:                           return "OK";
-    case MWEB_ERR_MISSING_SENDER_KEY:       return "PSBT is missing MWEB presign data";
-    case MWEB_ERR_MISSING_STEALTH_KEY:      return "PSBT is missing MWEB stealth presign data";
-    case MWEB_ERR_INVALID_PRESIGN_SCALAR:   return "Companion wallet sent invalid MWEB data (scalar out of range)";
-    case MWEB_ERR_OUTPUT_FIELD_MISMATCH:    return "MWEB output verification failed";
+    case MWEB_ERR_MISSING_STEALTH_SCALAR:      return "MWEB kernel signer was not given a stealth-excess scalar";
+    case MWEB_ERR_INVALID_SCALAR:   return "Internal scalar out of range or zero";
+    case MWEB_ERR_OUTPUT_FIELD_MISMATCH:    return "MWEB output is missing required fields";
     case MWEB_ERR_INPUT_COMMIT_MISMATCH:    return "MWEB input amount does not match on-chain commitment";
     case MWEB_ERR_BALANCE_FAIL:             return "MWEB transaction value balance is invalid";
     case MWEB_ERR_KERNEL_FEATURE_MISMATCH:  return "Invalid MWEB kernel: feature flags do not match kernel fields";

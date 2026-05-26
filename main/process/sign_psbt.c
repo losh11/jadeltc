@@ -897,7 +897,7 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
         // MWEB inputs have no standard UTXO — check FIRST, before UTXO fetch
         if (MWEB_IN_HAS_OUTPUT_ID(input->mweb_keyset)) {
             // Already signed? Count amount if available, skip validation.
-            // Amount (0x97) is presign-only and may be stripped after signing.
+            // Amount (0x97) is unsigned-only and may be stripped after signing.
             if (MWEB_HAS(input->mweb_keyset, MWEB_IN_INPUT_SIGNATURE)) {
                 if (MWEB_HAS(input->mweb_keyset, MWEB_IN_INPUT_AMOUNT)) {
                     mweb_input_amount += input->mweb_input_amount;
@@ -939,7 +939,7 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
                 continue; // Not our input — amount already counted above
             }
 
-            // Our input — validate presign required fields.
+            // Our input — validate required input fields.
             // Only the 0x99 ECDH path is accepted; shared-secret is gone.
             if (!MWEB_HAS(input->mweb_keyset, MWEB_IN_SPENT_OUTPUT_PUBKEY)
                 || !MWEB_HAS(input->mweb_keyset, MWEB_IN_SPENT_OUTPUT_COMMIT)
@@ -1192,7 +1192,7 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
         if (output_amount > total_input_amount
 #ifdef BUILD_MWEB
             // Skip check if signed MWEB inputs had their amount field stripped
-            // (0x97 is presign-only). Kernel fee is the authoritative source.
+            // (0x97 is unsigned-only). Kernel fee is the authoritative source.
             && !mweb_amounts_incomplete
 #endif
         ) {
@@ -1471,16 +1471,6 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
         mweb_session = NULL; /* consumed by commit/abort */
         if (cerr != MWEB_OK) {
             *errmsg = mweb_err_to_string(cerr);
-            retval = CBOR_RPC_INTERNAL_ERROR;
-            goto cleanup;
-        }
-
-        // S8: strip the presign proprietary fields so the returned
-        // PSBT is broadcast-ready. Clears 0xFC "JADE" 0x01 on every
-        // output and 0xFC "JADE" 0x02 on every kernel. Success path
-        // only; prior failure paths already rolled the PSBT back.
-        if (wally_psbt_strip_mweb_presign_fields(psbt) != WALLY_OK) {
-            *errmsg = "Failed to strip MWEB presign fields";
             retval = CBOR_RPC_INTERNAL_ERROR;
             goto cleanup;
         }

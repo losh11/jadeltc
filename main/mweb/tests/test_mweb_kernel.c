@@ -485,7 +485,7 @@ int main(void)
         }
     }
 
-    /* 15. Zero e_k → MWEB_ERR_INVALID_PRESIGN_SCALAR */
+    /* 15. Zero e_k → MWEB_ERR_INVALID_SCALAR */
     {
         static const uint8_t ZERO_EK[32] = {0};
         static const uint8_t ZERO[32] = {0};
@@ -502,14 +502,14 @@ int main(void)
 
         struct mweb_kernel_sign_outputs result;
         mweb_err_t err = mweb_sign_kernel_with_ek(ZERO_EK, &params, &result);
-        if (err == MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+        if (err == MWEB_ERR_INVALID_SCALAR) {
             PASS("ZERO_EK_REJECTED");
         } else {
-            FAIL("ZERO_EK_REJECTED", "expected INVALID_PRESIGN_SCALAR, got %d", err);
+            FAIL("ZERO_EK_REJECTED", "expected INVALID_SCALAR, got %d", err);
         }
     }
 
-    /* 16. e_k >= n → MWEB_ERR_INVALID_PRESIGN_SCALAR */
+    /* 16. e_k >= n → MWEB_ERR_INVALID_SCALAR */
     {
         /* secp256k1 order n */
         static const uint8_t ORDER_EK[32] = {
@@ -532,10 +532,10 @@ int main(void)
 
         struct mweb_kernel_sign_outputs result;
         mweb_err_t err = mweb_sign_kernel_with_ek(ORDER_EK, &params, &result);
-        if (err == MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+        if (err == MWEB_ERR_INVALID_SCALAR) {
             PASS("OVERFLOW_EK_REJECTED");
         } else {
-            FAIL("OVERFLOW_EK_REJECTED", "expected INVALID_PRESIGN_SCALAR, got %d", err);
+            FAIL("OVERFLOW_EK_REJECTED", "expected INVALID_SCALAR, got %d", err);
         }
     }
 
@@ -586,7 +586,7 @@ int main(void)
         }
     }
 
-    /* 19. Stealth bit set but stealth_key NULL → MWEB_ERR_MISSING_STEALTH_KEY */
+    /* 19. Stealth bit set but stealth_key NULL → MWEB_ERR_MISSING_STEALTH_SCALAR */
     {
         static const uint8_t EK[32] = {0x01};
         static const uint8_t ZERO[32] = {0};
@@ -602,10 +602,10 @@ int main(void)
 
         struct mweb_kernel_sign_outputs result;
         mweb_err_t err = mweb_sign_kernel_with_ek(EK, &params, &result);
-        if (err == MWEB_ERR_MISSING_STEALTH_KEY) {
+        if (err == MWEB_ERR_MISSING_STEALTH_SCALAR) {
             PASS("STEALTH_BIT_NO_KEY_REJECTED");
         } else {
-            FAIL("STEALTH_BIT_NO_KEY_REJECTED", "expected MISSING_STEALTH_KEY, got %d", err);
+            FAIL("STEALTH_BIT_NO_KEY_REJECTED", "expected MISSING_STEALTH_SCALAR, got %d", err);
         }
     }
 
@@ -633,7 +633,7 @@ int main(void)
         }
     }
 
-    /* 21. Zero stealth_key → MWEB_ERR_INVALID_PRESIGN_SCALAR */
+    /* 21. Zero stealth_key → MWEB_ERR_INVALID_SCALAR */
     {
         static const uint8_t EK[32] = {0x01};
         static const uint8_t ZERO[32] = {0};
@@ -650,10 +650,10 @@ int main(void)
 
         struct mweb_kernel_sign_outputs result;
         mweb_err_t err = mweb_sign_kernel_with_ek(EK, &params, &result);
-        if (err == MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+        if (err == MWEB_ERR_INVALID_SCALAR) {
             PASS("ZERO_STEALTH_KEY_REJECTED");
         } else {
-            FAIL("ZERO_STEALTH_KEY_REJECTED", "expected INVALID_PRESIGN_SCALAR, got %d", err);
+            FAIL("ZERO_STEALTH_KEY_REJECTED", "expected INVALID_SCALAR, got %d", err);
         }
     }
 

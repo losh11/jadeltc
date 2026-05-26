@@ -292,49 +292,6 @@ def blind_switch(blind, value):
     return out.to_bytes(32, "big")
 
 
-def derive_mweb_output(sender_key, A, B, value):
-    """Mirror of main/mweb/mweb_output.c — produces the fields Jade
-    rederives and compares against during MWEB output verification.
-
-    Returns a dict with:
-      blind, commit (0x91), sender_pubkey (0x93), output_pubkey (0x94),
-      key_exchange_pubkey (inside 0x95), view_tag (inside 0x95),
-      masked_value (inside 0x95), masked_nonce (inside 0x95).
-    """
-    n_16 = mweb_hashed(ord("N"), sender_key)[:16]
-    s_preimage = A + B + struct.pack("<Q", value) + n_16
-    s = mweb_hashed(ord("S"), s_preimage)
-
-    sA = ec_point_mul(A, s)
-    t = mweb_hashed(ord("D"), sA)
-
-    o_scalar = mweb_hashed(ord("O"), t)
-    K_o = ec_point_mul(B, o_scalar)
-    K_e = ec_point_mul(B, s)
-    K_s = ec_pubkey(sender_key)
-
-    mask_blind = mweb_hashed(ord("B"), t)
-    value_mask = struct.unpack("<Q", mweb_hashed(ord("Y"), t)[:8])[0]
-    nonce_mask_16 = mweb_hashed(ord("X"), t)[:16]
-
-    blind = blind_switch(mask_blind, value)
-    commit = pedersen_commit(blind, value)
-    masked_value = value ^ value_mask
-    masked_nonce = bytes(a ^ b for a, b in zip(n_16, nonce_mask_16))
-    view_tag = mweb_hashed(ord("T"), sA)[0]
-
-    return {
-        "blind": blind,
-        "commit": commit,
-        "sender_pubkey": K_s,
-        "output_pubkey": K_o,
-        "key_exchange_pubkey": K_e,
-        "view_tag": view_tag,
-        "masked_value": masked_value,
-        "masked_nonce": masked_nonce,
-    }
-
-
 def derive_mweb_input_commit(scan_key, key_exchange_pk, value):
     """Compute the spent_output_commit Jade expects on a Jade-owned input.
     C_in = Pedersen(r_in, v_in) where r_in = BlindSwitch(Hashed('B', ss), v)
@@ -342,28 +299,6 @@ def derive_mweb_input_commit(scan_key, key_exchange_pk, value):
     ss = mweb_hashed(ord("D"), ec_point_mul(key_exchange_pk, scan_key))
     r_in = blind_switch(mweb_hashed(ord("B"), ss), value)
     return pedersen_commit(r_in, value), r_in
-
-
-def encode_mweb_standard_fields(
-    key_exchange_pubkey, view_tag, masked_value, masked_nonce
-):
-    """0x95 payload: K_e (33) || viewTag (1) || maskedValue (LE u64) ||
-    maskedNonce (16B BE) — 58 bytes total."""
-    assert len(key_exchange_pubkey) == 33
-    assert 0 <= view_tag < 256
-    assert len(masked_nonce) == 16
-    return (
-        key_exchange_pubkey
-        + bytes([view_tag])
-        + struct.pack("<Q", masked_value)
-        + masked_nonce
-    )
-
-
-def jade_presign_key(subtype):
-    """Proprietary PSBT key body after the leading 0xFC byte:
-    compact_size(4) || 'JADE' || subtype (single-byte varint)."""
-    return compact_size(4) + b"JADE" + compact_size(subtype)
 
 
 def _decompress_pedersen(commit_33):
@@ -926,10 +861,13 @@ def test_sign_mweb_input_removed(jade):
 
 def test_mweb_psbt(jade, mweb_ctx):
     # Build a pure-MWEB PSBTv2 with one Jade-owned MWEB input + one
-    # Jade-owned MWEB output + one kernel, populate every presign /
-    # rederivation field the atomic MWEB pass requires, and confirm
-    # Jade signs it end-to-end. Requires manual confirmation on the
-    # device: 1 MWEB output screen, 1 pegin/fee screen, final fee.
+    # Jade-owned MWEB output + one kernel in the unsigned shape that
+    # the device accepts: the host supplies stealth_address + amount
+    # on the output and the device builds every other byte (commit,
+    # senderKey, K_s, K_o, standard fields, rangeproof, signature,
+    # tx_offset, stealth_offset, kernel excess + signature) on chip
+    # at session_commit. Requires manual confirmation on the device:
+    # 1 MWEB output screen, 1 pegin/fee screen, final fee.
     print("\n=== Test 3: MWEB PSBTv2 signing (sign_psbt) ===\n")
 
     scan_key = mweb_ctx["scan_key"]
@@ -943,7 +881,7 @@ def test_mweb_psbt(jade, mweb_ctx):
     kernel_fee = input_amount - output_amount
 
     input_features = 0x01  # STEALTH_KEY (input-side bit)
-    output_features = 0x01  # STANDARD_FIELDS (bit gating 0x95 on the output)
+    output_features = 0x01  # STANDARD_FIELDS — gates the K_e/tag/v/n section of the on-chain MwebOutputMessage
     kernel_features = 0x01  # FEE_BIT only — no pegin / pegout / stealth excess
 
     # Input side: synthesize a key-exchange secret, compute the
@@ -956,43 +894,34 @@ def test_mweb_psbt(jade, mweb_ctx):
         scan_key, spend_pub, input_address_index, kex_pk
     )
     spent_output_id = os.urandom(32)
-    spent_output_commit, r_in = derive_mweb_input_commit(scan_key, kex_pk, input_amount)
+    spent_output_commit, _r_in = derive_mweb_input_commit(
+        scan_key, kex_pk, input_amount
+    )
 
-    # Output side: derive the destination (A_i, B_i), pick a random
-    # senderKey, and rederive every field the atomic pass compares
-    # against (commit, K_s, K_o, K_e, viewTag, maskedValue, maskedNonce).
-    sender_key = random_valid_secret()
+    # Output side: derive the destination stealth address (A || B).
+    # The device generates the senderKey via TRNG on chip and writes
+    # every output field at commit; the host ships only the address.
     dest_Ai, dest_Bi = derive_mweb_stealth_components(
         scan_key, spend_pub, output_address_index
     )
     stealth_address = dest_Ai + dest_Bi
-    out = derive_mweb_output(sender_key, dest_Ai, dest_Bi, output_amount)
-    standard_fields = encode_mweb_standard_fields(
-        out["key_exchange_pubkey"],
-        out["view_tag"],
-        out["masked_value"],
-        out["masked_nonce"],
-    )
 
     print(f"  Input: index={input_address_index} amount={input_amount}", flush=True)
     print(f"  Output: index={output_address_index} amount={output_amount}", flush=True)
     print(f"  Fee: {kernel_fee}", flush=True)
 
     # ─── PSBTv2 globals ─────────────────────────────────────────────
-    # The phased host flow hands Jade the post-output-signing offsets:
-    # tx_offset = Sum(r_out_j), stealth_offset = Sum(senderKey_j). Jade
-    # then subtracts owned-input blinds + e_k (tx) and adds input stealth
-    # tweaks - stealth_key (stealth) to arrive at the final global offsets
-    # consensus expects. Omitting these globals makes Jade start from zero
-    # and produces offsets that fail the consensus kernel-balance check.
+    # MWEB globals tx_offset (0x90) and stealth_offset (0x91) are
+    # device-write-only: omit them on the unsigned PSBT. The device
+    # silently overrides any host-supplied bytes via its
+    # device-derived sums, so leaving them out is required for a
+    # round-trip byte match.
     psbt = b"psbt\xff"
     psbt += kv(0xFB, b"", struct.pack("<I", 2))
     psbt += kv(0x02, b"", struct.pack("<I", 2))
     psbt += kv(0x04, b"", compact_size(1))
     psbt += kv(0x05, b"", compact_size(1))
-    psbt += kv(0x90, b"", out["blind"])  # MWEB tx offset (= Sum r_out)
-    psbt += kv(0x91, b"", sender_key)  # MWEB stealth offset (= Sum senderKey)
-    psbt += kv(0x92, b"", compact_size(1))
+    psbt += kv(0x92, b"", compact_size(1))  # MWEB kernel count
     psbt += separator()
 
     # ─── MWEB input ────────────────────────────────────────────────
@@ -1017,14 +946,13 @@ def test_mweb_psbt(jade, mweb_ctx):
     psbt += separator()
 
     # ─── MWEB output ───────────────────────────────────────────────
+    # Unsigned shape: only amount, stealth address, and features. The
+    # device writes 0x91 (commit), 0x93 (K_s), 0x94 (K_o), 0x95
+    # (standard fields), 0x96 (rangeproof), 0x97 (output signature)
+    # during mweb_session_commit.
     psbt += kv(0x03, b"", struct.pack("<Q", output_amount))  # PSBTv2 amount
     psbt += kv(0x90, b"", stealth_address)  # (A || B)
-    psbt += kv(0x91, b"", out["commit"])  # C_out
     psbt += kv(0x92, b"", bytes([output_features]))
-    psbt += kv(0x93, b"", out["sender_pubkey"])  # K_s
-    psbt += kv(0x94, b"", out["output_pubkey"])  # K_o
-    psbt += kv(0x95, b"", standard_fields)  # K_e||tag||mv||mn
-    psbt += kv(0xFC, jade_presign_key(0x01), sender_key)  # senderKey presign
     psbt += separator()
 
     # ─── Kernel ────────────────────────────────────────────────────
@@ -1042,14 +970,14 @@ def test_mweb_psbt(jade, mweb_ctx):
     assert len(sections) >= 4, f"Expected >=4 PSBT sections, got {len(sections)}"
     global_section, input_section, output_section, kernel_section = sections[:4]
 
-    # Globals: Jade writes both MWEB offsets.
+    # Globals: device writes both MWEB offsets.
     tx_offset = find_field(global_section, 0x90)[1]
     stealth_offset = find_field(global_section, 0x91)[1]
     assert len(tx_offset) == 32 and any(tx_offset)
     assert len(stealth_offset) == 32
 
-    # MWEB input: signature, input pubkey, and the host-supplied commit
-    # survive byte-identical (Jade does NOT re-write 0x91).
+    # MWEB input: device adds signature (0x95) + input pubkey (0x93);
+    # the host-supplied commit (0x91) survives byte-identical.
     input_sig = find_field(input_section, 0x95)[1]
     input_pubkey = find_field(input_section, 0x93)[1]
     input_commit_after = find_field(input_section, 0x91)[1]
@@ -1057,13 +985,23 @@ def test_mweb_psbt(jade, mweb_ctx):
     assert len(input_pubkey) == 33
     assert input_commit_after == spent_output_commit
 
-    # MWEB output: every rederivation field survives; stealth address
-    # and presign senderKey survive (Jade does not strip them).
+    # MWEB output: device-built fields. Stealth address survives;
+    # everything else is fresh on each signing (TRNG senderKey makes
+    # the proof and signature random). Cryptographic correctness is
+    # validated via the kernel + stealth balance equations below.
     assert find_field(output_section, 0x90)[1] == stealth_address
-    assert find_field(output_section, 0x91)[1] == out["commit"]
-    assert find_field(output_section, 0x93)[1] == out["sender_pubkey"]
-    assert find_field(output_section, 0x94)[1] == out["output_pubkey"]
-    assert find_field(output_section, 0x95)[1] == standard_fields
+    output_commit = find_field(output_section, 0x91)[1]
+    output_sender_pubkey = find_field(output_section, 0x93)[1]
+    output_output_pubkey = find_field(output_section, 0x94)[1]
+    output_std_fields = find_field(output_section, 0x95)[1]
+    output_rangeproof = find_field(output_section, 0x96)[1]
+    output_signature = find_field(output_section, 0x97)[1]
+    assert len(output_commit) == 33 and output_commit[0] in (0x08, 0x09)
+    assert len(output_sender_pubkey) == 33
+    assert len(output_output_pubkey) == 33
+    assert len(output_std_fields) == 58
+    assert len(output_rangeproof) == 675
+    assert len(output_signature) == 64 and any(output_signature)
 
     # Kernel: excess_commitment (0x00) + signature (0x08) populated.
     kernel_excess = find_field(kernel_section, 0x00)[1]
@@ -1071,20 +1009,20 @@ def test_mweb_psbt(jade, mweb_ctx):
     assert len(kernel_excess) == 33 and kernel_excess[0] in (0x08, 0x09)
     assert len(kernel_sig) == 64 and any(kernel_sig)
 
-    # Consensus-level kernel balance. Without these the on-chain node
-    # would reject the tx on broadcast even though Jade signed it — this
-    # is the sanity check for the pre-Jade global offsets added above.
+    # Consensus-level kernel balance using device-emitted commit + offsets.
+    # Cross-checks Jade's tx_offset against (C_out - C_in - fee*H - E_k)/G.
     assert verify_mweb_kernel_balance(
-        c_out=out["commit"],
+        c_out=output_commit,
         c_in=spent_output_commit,
         fee=kernel_fee,
         e_k=kernel_excess,
         tx_offset=tx_offset,
     ), "MWEB kernel balance (C_out - C_in - fee*H == E_k + O_k*G) failed"
 
+    # Stealth balance using device-emitted sender_pubkey + offsets.
     assert verify_mweb_stealth_balance(
         stealth_offset=stealth_offset,
-        sender_pubkey=out["sender_pubkey"],
+        sender_pubkey=output_sender_pubkey,
         input_pubkey=input_pubkey,
         spent_output_pubkey=spent_output_pubkey,
     ), "MWEB stealth-offset balance (O_s*G == K_s + K_i - K_o) failed"

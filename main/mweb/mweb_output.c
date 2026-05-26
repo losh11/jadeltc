@@ -234,7 +234,7 @@ mweb_err_t mweb_derive_output(
         return MWEB_ERR_INTERNAL;
     }
     if (!mweb_validate_scalar(sender_key)) {
-        return MWEB_ERR_INVALID_PRESIGN_SCALAR;
+        return MWEB_ERR_INVALID_SCALAR;
     }
     const secp256k1_context *ctx = wally_get_secp_context();
     if (!ctx) {
@@ -322,7 +322,7 @@ static mweb_err_t build_output_impl(
         return MWEB_ERR_INTERNAL;
     }
     if (!mweb_validate_scalar(sender_key)) {
-        return MWEB_ERR_INVALID_PRESIGN_SCALAR;
+        return MWEB_ERR_INVALID_SCALAR;
     }
     /* extra_data shape contract: bit set ↔ caller intends to emit bytes
      * (zero bytes are legal — yields compact_size(0)); bit clear means

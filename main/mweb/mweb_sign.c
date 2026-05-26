@@ -66,7 +66,7 @@ mweb_err_t mweb_derive_input_state(
 
     /* STEALTH_KEY_BIT is required for any MWEB input Jade signs. */
     if (!(features & MWEB_INPUT_STEALTH_KEY_BIT)) {
-        return MWEB_ERR_INVALID_PRESIGN_SCALAR;
+        return MWEB_ERR_INVALID_SCALAR;
     }
 
     memset(out_state, 0, sizeof(*out_state));
@@ -173,7 +173,7 @@ mweb_err_t mweb_derive_input_state(
 
     /* ephemeral = get_random(32), validated canonical (non-zero, < n).
      * TRNG failure here is astronomically rare; we retry a few times
-     * before surfacing MWEB_ERR_INVALID_PRESIGN_SCALAR to the caller. */
+     * before surfacing MWEB_ERR_INVALID_SCALAR to the caller. */
     {
         bool got_scalar = false;
         for (int tries = 0; tries < 8; ++tries) {
@@ -184,7 +184,7 @@ mweb_err_t mweb_derive_input_state(
             }
         }
         if (!got_scalar) {
-            err = MWEB_ERR_INVALID_PRESIGN_SCALAR;
+            err = MWEB_ERR_INVALID_SCALAR;
             goto cleanup;
         }
     }

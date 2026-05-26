@@ -309,7 +309,7 @@ mweb_err_t mweb_sign_kernel_with_ek(
 
     /* 1a. Validate e_k */
     if (!mweb_validate_scalar(e_k)) {
-        err = MWEB_ERR_INVALID_PRESIGN_SCALAR;
+        err = MWEB_ERR_INVALID_SCALAR;
         goto cleanup;
     }
 
@@ -343,7 +343,7 @@ mweb_err_t mweb_sign_kernel_with_ek(
 
     /* 1c. Stealth-excess binding */
     if ((in->features & MWEB_KERNEL_STEALTH_EXCESS_BIT) && !in->stealth_key_or_null) {
-        err = MWEB_ERR_MISSING_STEALTH_KEY;
+        err = MWEB_ERR_MISSING_STEALTH_SCALAR;
         goto cleanup;
     }
     if (!(in->features & MWEB_KERNEL_STEALTH_EXCESS_BIT) && in->stealth_key_or_null) {
@@ -354,7 +354,7 @@ mweb_err_t mweb_sign_kernel_with_ek(
     /* 1d. Validate stealth_key if present */
     if (in->stealth_key_or_null) {
         if (!mweb_validate_scalar(in->stealth_key_or_null)) {
-            err = MWEB_ERR_INVALID_PRESIGN_SCALAR;
+            err = MWEB_ERR_INVALID_SCALAR;
             goto cleanup;
         }
     }

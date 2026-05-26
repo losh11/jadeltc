@@ -132,13 +132,18 @@ __attribute__((weak)) bool network_is_litecoin(network_t n)
         || n == NETWORK_LITECOIN_REGTEST;
 }
 
+/* Forward declaration — the body lives further down with the other
+ * snapshot/restore helpers. Pulled forward so the build-path tests
+ * can use it without rearranging the file. */
+static bool wally_maps_byte_equal(const struct wally_map *a,
+                                   const struct wally_map *b);
+
 static void test_err_to_string_covers_all_codes(void)
 {
     const mweb_err_t codes[] = {
         MWEB_OK,
-        MWEB_ERR_MISSING_SENDER_KEY,
-        MWEB_ERR_MISSING_STEALTH_KEY,
-        MWEB_ERR_INVALID_PRESIGN_SCALAR,
+        MWEB_ERR_MISSING_STEALTH_SCALAR,
+        MWEB_ERR_INVALID_SCALAR,
         MWEB_ERR_OUTPUT_FIELD_MISMATCH,
         MWEB_ERR_INPUT_COMMIT_MISMATCH,
         MWEB_ERR_BALANCE_FAIL,
@@ -1226,7 +1231,7 @@ static bool build_owned_mweb_input(
     memcpy(pi->mweb_key_exchange_pubkey, Ke,               33);
     pi->mweb_address_index  = 0;
     /* MWEB_INPUT_STEALTH_KEY_BIT (0x01) must be set — mweb_derive_input_state
-     * rejects inputs without it as INVALID_PRESIGN_SCALAR (mweb_sign.c:68).
+     * rejects inputs without it as INVALID_SCALAR (mweb_sign.c:68).
      * The bit says "I hold a stealth key derived from scan+spend", which
      * is the only mode Jade supports in v1. */
     pi->mweb_input_features = 0x01;  /* MWEB_INPUT_STEALTH_KEY_BIT */
@@ -1283,26 +1288,28 @@ static bool build_owned_mweb_input(
 }
 
 /*
- * Build a PSBT output at psbt->outputs[0] that satisfies the
- * recipient-binding rederivation. `sender_key` is the per-output
- * random scalar Jade accepts as the 0xFC"JADE"0x01 proprietary
- * presign field; every other field is derived from it using
- * mweb_derive_output.
+ * Build a PSBT output at psbt->outputs[0] in the unsigned-MWEB shape
+ * the device now accepts: the host supplies the stealth address (0x90)
+ * and amount (and optional 0x92 features / 0x98 extra_data) and the
+ * device generates everything else during mweb_session_begin /
+ * mweb_session_commit. The address is derived from the canonical test
+ * scan/spend keys at index 0 so the result is deterministic.
+ *
+ * If `features` is zero, no 0x92 entry is written (the device defaults
+ * to STANDARD_FIELDS_BIT). If `extra_data_len` is zero, no 0x98 entry
+ * is written.
  */
-static bool build_mweb_output(
+static bool setup_unsigned_mweb_output(
     struct wally_psbt *psbt,
-    const uint8_t sender_key[32],
-    uint64_t value)
+    uint64_t value,
+    uint8_t features,
+    const uint8_t *extra_data, size_t extra_data_len)
 {
     const secp256k1_context *ctx = wally_get_secp_context();
     if (!ctx) return false;
 
     struct wally_psbt_output *po = &psbt->outputs[0];
 
-    /* init_alloc zeroes outputs[0] but does NOT call psbt_output_init.
-     * The `unknowns` and `psbt_fields` maps both need initialization
-     * before wally_map_add / wally_psbt_output_set_mweb_presign_sender_key
-     * can touch them. */
     if (wally_map_init(0, NULL, &po->unknowns) != WALLY_OK) return false;
 
     /* A_i = scan * B_i, B_i = spend_pub + m_i*G with index = 0. */
@@ -1331,53 +1338,36 @@ static bool build_mweb_output(
     uint8_t A_i[33]; size_t al = 33;
     secp256k1_ec_pubkey_serialize(ctx, A_i, &al, &Ai_pk, SECP256K1_EC_COMPRESSED);
 
-    /* Derive the recipient-binding fields. */
-    struct mweb_derived_output d;
-    if (mweb_derive_output(sender_key, A_i, B_i, value, &d) != MWEB_OK) {
-        return false;
-    }
-
     po->has_amount = 1;
     po->amount = value;
 
-    /* 0x90 stealth address: A || B, 66 bytes. */
-    uint8_t sa[66];
-    memcpy(sa,      A_i, 33);
-    memcpy(sa + 33, B_i, 33);
-    uint8_t k;
+    /* MWEB output fields live in first-class wally_psbt_output struct
+     * slots. The host-supplied entries on an unsigned PSBT are
+     * stealth_address (required), features (optional), and extra_data
+     * (optional, heap-owned). The keyset bit tracks presence per
+     * field. */
+    memcpy(po->mweb_stealth_address,      A_i, 33);
+    memcpy(po->mweb_stealth_address + 33, B_i, 33);
 
-    k = 0x90;
-    if (wally_map_add(&po->unknowns, &k, 1, sa, 66) != WALLY_OK) return false;
-    k = 0x91;
-    if (wally_map_add(&po->unknowns, &k, 1, d.commit,         33) != WALLY_OK) return false;
-    k = 0x93;
-    if (wally_map_add(&po->unknowns, &k, 1, d.sender_pubkey,  33) != WALLY_OK) return false;
-    k = 0x94;
-    if (wally_map_add(&po->unknowns, &k, 1, d.output_pubkey,  33) != WALLY_OK) return false;
+    uint16_t keyset = (uint16_t)(1u << (0x90 - 0x90)); /* STEALTH_ADDRESS */
 
-    /* 0x95 standard fields: Ke(33) || viewTag(1) || maskedValue(8 LE) || maskedNonce(16 BE). */
-    uint8_t sf[58];
-    memcpy(sf, d.key_exchange_pubkey, 33);
-    sf[33] = d.view_tag;
-    for (int i = 0; i < 8; i++) sf[34 + i] = (uint8_t)(d.masked_value >> (i * 8));
-    memcpy(sf + 42, d.masked_nonce, 16);
-    k = 0x95;
-    if (wally_map_add(&po->unknowns, &k, 1, sf, 58) != WALLY_OK) return false;
-
-    /* Proprietary presign 0xFC "JADE" 0x01 — sender_key. */
-    if (wally_psbt_output_set_mweb_presign_sender_key(po, sender_key, 32)
-        != WALLY_OK) return false;
+    if (features != 0) {
+        po->mweb_features = features;
+        keyset |= (uint16_t)(1u << (0x92 - 0x90));
+    }
+    if (extra_data_len > 0) {
+        po->mweb_extra_data = wally_malloc(extra_data_len);
+        if (!po->mweb_extra_data) return false;
+        memcpy(po->mweb_extra_data, extra_data, extra_data_len);
+        po->mweb_extra_data_len = extra_data_len;
+        keyset |= (uint16_t)(1u << (0x98 - 0x90));
+    }
 
     /* MWEB_OUT_IS_MWEB gates session_begin's output loop on the presence
-     * of 0x90 (stealth addr) or 0x91 (commit) in mweb_output_keyset.
-     * Without this the output is skipped, Sum(v_out)=0, and balance
-     * fails with BALANCE_FAIL. */
-    po->mweb_output_keyset
-        = (1u << (0x90 - 0x90))   /* STEALTH_ADDRESS */
-        | (1u << (0x91 - 0x90))   /* COMMIT */
-        | (1u << (0x93 - 0x90))   /* SENDER_PUBKEY */
-        | (1u << (0x94 - 0x90))   /* OUTPUT_PUBKEY */
-        | (1u << (0x95 - 0x90));  /* STANDARD_FIELDS */
+     * of 0x90 (stealth addr) or 0x91 (commit). Without 0x90 set here
+     * the output would be skipped, Sum(v_out)=0, and balance would
+     * fail with BALANCE_FAIL. */
+    po->mweb_output_keyset = keyset;
 
     psbt->num_outputs = 1;
     return true;
@@ -1735,25 +1725,31 @@ static void test_input_commit_not_rewritten(void)
  * A regression that short-circuits the output verification chain
  * (e.g. failing to rederive K_o / K_e / masked_* / commit) fails here.
  */
-static void test_mweb_output_s2_binding_ok(void)
+/*
+ * Build-path happy path: an unsigned MWEB PSBT (stealth+amount only)
+ * goes in, a fully-signed MWEB PSBT comes out. Asserts every
+ * device-owned struct field the commit path writes is populated at
+ * the right slot with the right width, both globals (tx_offset,
+ * stealth_offset) are set, and `mweb_session_get_output_value`
+ * returns the verified amount.
+ */
+static void test_mweb_output_build_and_commit_ok(void)
 {
     struct wally_psbt *psbt = NULL;
     if (wally_psbt_init_alloc(2, 0, 1, 0, 0, &psbt) != WALLY_OK || !psbt) {
-        printf("FAIL: output_s2_ok — wally_psbt_init_alloc\n");
+        printf("FAIL: build_ok — wally_psbt_init_alloc\n");
         failures++;
         return;
     }
 
-    static const uint8_t sender_key[32] = { [0 ... 31] = 0x11 };
     const uint64_t value = 42000000ULL;
-    if (!build_mweb_output(psbt, sender_key, value)) {
-        printf("FAIL: output_s2_ok — build_mweb_output\n");
+    if (!setup_unsigned_mweb_output(psbt, value, 0, NULL, 0)) {
+        printf("FAIL: build_ok — setup_unsigned_mweb_output\n");
         failures++;
         wally_psbt_free(psbt);
         return;
     }
 
-    /* Balanced kernel: pegin covers MWEB output + fee. */
     struct wally_psbt_kernel kernel;
     memset(&kernel, 0, sizeof(kernel));
     kernel.has_fee = 1; kernel.fee = 1000;
@@ -1770,22 +1766,20 @@ static void test_mweb_output_s2_binding_ok(void)
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
-        printf("FAIL: output_s2_ok — begin returned %d\n", err);
+        printf("FAIL: build_ok — begin returned %d\n", err);
         ok = false;
     }
 
-    /* The session should have recorded the MWEB output and we can query
-     * its verified value. */
     if (ok) {
         uint64_t v_out = 0;
         if (mweb_session_get_output_value(s, 0, &v_out) != MWEB_OK
             || v_out != value) {
-            printf("FAIL: output_s2_ok — get_output_value got %llu want %llu\n",
+            printf("FAIL: build_ok — get_output_value got %llu want %llu\n",
                 (unsigned long long)v_out, (unsigned long long)value);
             ok = false;
         }
         if (mweb_session_num_mweb_outputs(s) != 1) {
-            printf("FAIL: output_s2_ok — num_mweb_outputs != 1\n");
+            printf("FAIL: build_ok — num_mweb_outputs != 1\n");
             ok = false;
         }
     }
@@ -1793,7 +1787,42 @@ static void test_mweb_output_s2_binding_ok(void)
     if (ok) {
         err = mweb_session_commit(s, psbt);
         if (err != MWEB_OK) {
-            printf("FAIL: output_s2_ok — commit returned %d\n", err);
+            printf("FAIL: build_ok — commit returned %d\n", err);
+            ok = false;
+        }
+    }
+
+    /* Verify every keyset bit the device must set + the range_proof
+     * heap allocation. The struct-field bytes are device-built scalars,
+     * so we don't pin specific contents here — only that they're at the
+     * expected slots with the expected widths. */
+    if (ok) {
+        const uint16_t expected_bits =
+              (uint16_t)(1u << (0x90 - 0x90))   /* STEALTH_ADDRESS */
+            | (uint16_t)(1u << (0x91 - 0x90))   /* COMMIT */
+            | (uint16_t)(1u << (0x92 - 0x90))   /* FEATURES */
+            | (uint16_t)(1u << (0x93 - 0x90))   /* SENDER_PUBKEY */
+            | (uint16_t)(1u << (0x94 - 0x90))   /* OUTPUT_PUBKEY */
+            | (uint16_t)(1u << (0x95 - 0x90))   /* STANDARD_FIELDS */
+            | (uint16_t)(1u << (0x96 - 0x90))   /* RANGE_PROOF */
+            | (uint16_t)(1u << (0x97 - 0x90));  /* SIGNATURE */
+        if ((psbt->outputs[0].mweb_output_keyset & expected_bits)
+                != expected_bits) {
+            printf("FAIL: build_ok — keyset bits 0x%04x missing (have 0x%04x)\n",
+                expected_bits, psbt->outputs[0].mweb_output_keyset);
+            ok = false;
+        }
+        if (ok && (!psbt->outputs[0].mweb_range_proof
+                   || psbt->outputs[0].mweb_range_proof_len != MWEB_RANGEPROOF_LEN)) {
+            printf("FAIL: build_ok — range_proof not heap-allocated (ptr=%p len=%zu)\n",
+                (void*)psbt->outputs[0].mweb_range_proof,
+                psbt->outputs[0].mweb_range_proof_len);
+            ok = false;
+        }
+    }
+    if (ok) {
+        if (!psbt->has_mweb_tx_offset || !psbt->has_mweb_stealth_offset) {
+            printf("FAIL: build_ok — globals not populated\n");
             ok = false;
         }
     }
@@ -1804,48 +1833,51 @@ static void test_mweb_output_s2_binding_ok(void)
     wally_map_clear(&kernel.unknowns);
     wally_psbt_free(psbt);
 
-    if (ok) printf("PASS: mweb_output_s2_binding_ok\n");
+    if (ok) printf("PASS: mweb_output_build_and_commit_ok\n");
     else failures++;
 }
 
 /*
- * Tamper check: flip one byte of the host-supplied MWEB output
- * commit. Jade's rederivation must diverge from the tampered PSBT
- * field and return MWEB_ERR_OUTPUT_FIELD_MISMATCH. This is the
- * primary theft-prevention assertion — without it a compromised
- * companion could substitute an attacker-owned output body while
- * the displayed stealth address still reads the honest recipient.
+ * Begin stages output bytes in the session arena but must not write
+ * them to po->unknowns until commit; abort therefore leaves the
+ * outputs byte-identical to begin-entry state (the unsigned shape).
  */
-static void test_mweb_output_s2_tampered_commit_rejects(void)
+static void test_mweb_output_build_abort_restores_psbt(void)
 {
     struct wally_psbt *psbt = NULL;
     if (wally_psbt_init_alloc(2, 0, 1, 0, 0, &psbt) != WALLY_OK || !psbt) {
-        printf("FAIL: output_s2_tampered — wally_psbt_init_alloc\n");
+        printf("FAIL: build_abort_restores — wally_psbt_init_alloc\n");
         failures++;
         return;
     }
 
-    static const uint8_t sender_key[32] = { [0 ... 31] = 0x22 };
     const uint64_t value = 7000000ULL;
-    if (!build_mweb_output(psbt, sender_key, value)) {
-        printf("FAIL: output_s2_tampered — build_mweb_output\n");
+    if (!setup_unsigned_mweb_output(psbt, value, 0, NULL, 0)) {
+        printf("FAIL: build_abort_restores — setup_unsigned_mweb_output\n");
         failures++;
         wally_psbt_free(psbt);
         return;
     }
+    const uint16_t pre_keyset = psbt->outputs[0].mweb_output_keyset;
+    /* Snapshot the begin-entry stealth_address so we can assert it
+     * survives abort byte-identical (commit never touches it, so
+     * snapshot/restore should leave it alone). */
+    uint8_t pre_stealth[66];
+    memcpy(pre_stealth, psbt->outputs[0].mweb_stealth_address, 66);
 
-    /* Tamper the 0x91 commit by one bit. */
-    uint8_t commit_key = 0x91;
-    size_t found = 0;
-    if (wally_map_find(&psbt->outputs[0].unknowns, &commit_key, 1, &found)
-            != WALLY_OK || found == 0) {
-        printf("FAIL: output_s2_tampered — commit not in unknowns\n");
+    /* Independent deep clone of begin-entry output unknowns (non-MWEB
+     * unknowns map — MWEB output bytes live in first-class struct fields). */
+    struct wally_map expected;
+    memset(&expected, 0, sizeof(expected));
+    if (wally_map_init(psbt->outputs[0].unknowns.items_allocation_len,
+                       NULL, &expected) != WALLY_OK
+        || wally_map_combine(&expected, &psbt->outputs[0].unknowns) != WALLY_OK) {
+        printf("FAIL: build_abort_restores — clone expected\n");
         failures++;
+        wally_map_clear(&expected);
         wally_psbt_free(psbt);
         return;
     }
-    struct wally_map_item *item = &psbt->outputs[0].unknowns.items[found - 1];
-    item->value[16] ^= 0x01;
 
     struct wally_psbt_kernel kernel;
     memset(&kernel, 0, sizeof(kernel));
@@ -1861,9 +1893,117 @@ static void test_mweb_output_s2_tampered_commit_rejects(void)
     mweb_session_t *s = NULL;
     mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
 
-    bool ok = (err == MWEB_ERR_OUTPUT_FIELD_MISMATCH) && (s == NULL);
-    if (!ok) {
-        printf("FAIL: output_s2_tampered — expected OUTPUT_FIELD_MISMATCH got %d\n", err);
+    bool ok = true;
+    if (err != MWEB_OK || !s) {
+        printf("FAIL: build_abort_restores — begin returned %d\n", err);
+        ok = false;
+    }
+
+    if (ok) {
+        mweb_session_abort(s, psbt);
+        s = NULL;
+
+        if (!wally_maps_byte_equal(&psbt->outputs[0].unknowns, &expected)) {
+            printf("FAIL: build_abort_restores — unknowns drifted across begin/abort\n");
+            ok = false;
+        }
+        if (psbt->outputs[0].mweb_output_keyset != pre_keyset) {
+            printf("FAIL: build_abort_restores — keyset drifted (got %04x want %04x)\n",
+                psbt->outputs[0].mweb_output_keyset, pre_keyset);
+            ok = false;
+        }
+        /* Host-supplied stealth_address must survive abort untouched. */
+        if (memcmp(psbt->outputs[0].mweb_stealth_address, pre_stealth, 66) != 0) {
+            printf("FAIL: build_abort_restores — stealth_address mutated\n");
+            ok = false;
+        }
+        /* range_proof was NULL at begin-entry (unsigned shape). Commit
+         * allocated then abort must have freed and reset to NULL. */
+        if (psbt->outputs[0].mweb_range_proof != NULL
+            || psbt->outputs[0].mweb_range_proof_len != 0) {
+            printf("FAIL: build_abort_restores — range_proof not freed by abort\n");
+            ok = false;
+        }
+    }
+
+    wally_map_clear(&expected);
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+    wally_psbt_free(psbt);
+
+    if (ok) printf("PASS: mweb_output_build_abort_restores_psbt\n");
+    else failures++;
+}
+
+/*
+ * Host-supplied psbt->mweb_tx_offset / psbt->mweb_stealth_offset must
+ * NOT influence the kernel sign — the offsets come from device-built
+ * blinds and senderKeys. Pre-populate both with non-zero garbage and
+ * confirm the post-commit values are different (so a stale or hostile
+ * host cannot smuggle scalar contributions into the kernel signature).
+ */
+static void test_mweb_output_build_ignores_host_offsets(void)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 1, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: build_ignores_offsets — wally_psbt_init_alloc\n");
+        failures++;
+        return;
+    }
+
+    const uint64_t value = 3000000ULL;
+    if (!setup_unsigned_mweb_output(psbt, value, 0, NULL, 0)) {
+        printf("FAIL: build_ignores_offsets — setup_unsigned_mweb_output\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+
+    /* Stale-host bytes — non-zero, distinct, so a passthrough would
+     * leave them visibly unchanged post-commit. */
+    uint8_t host_tx[32], host_stealth[32];
+    memset(host_tx,      0xCC, sizeof(host_tx));
+    memset(host_stealth, 0xDD, sizeof(host_stealth));
+    psbt->has_mweb_tx_offset = 1;
+    memcpy(psbt->mweb_tx_offset, host_tx, 32);
+    psbt->has_mweb_stealth_offset = 1;
+    memcpy(psbt->mweb_stealth_offset, host_stealth, 32);
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    kernel.has_fee = 1; kernel.fee = 1000;
+    kernel.has_pegin_amount = 1; kernel.pegin_amount = value + 1000;
+    kernel.has_features = 1;
+    kernel.features = MWEB_TEST_FEE_BIT | MWEB_TEST_PEGIN_BIT;
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0;
+
+    seed_trng_nonzero(0x42);
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    bool ok = true;
+    if (err != MWEB_OK || !s) {
+        printf("FAIL: build_ignores_offsets — begin returned %d\n", err);
+        ok = false;
+    }
+    if (ok && mweb_session_commit(s, psbt) != MWEB_OK) {
+        printf("FAIL: build_ignores_offsets — commit failed\n");
+        ok = false;
+    }
+
+    if (ok) {
+        if (memcmp(psbt->mweb_tx_offset, host_tx, 32) == 0) {
+            printf("FAIL: build_ignores_offsets — tx_offset matches host garbage\n");
+            ok = false;
+        }
+        if (memcmp(psbt->mweb_stealth_offset, host_stealth, 32) == 0) {
+            printf("FAIL: build_ignores_offsets — stealth_offset matches host garbage\n");
+            ok = false;
+        }
     }
 
     psbt->mweb_kernels = NULL;
@@ -1872,7 +2012,7 @@ static void test_mweb_output_s2_tampered_commit_rejects(void)
     wally_map_clear(&kernel.unknowns);
     wally_psbt_free(psbt);
 
-    if (ok) printf("PASS: mweb_output_s2_tampered_commit_rejects\n");
+    if (ok) printf("PASS: mweb_output_build_ignores_host_offsets\n");
     else failures++;
 }
 
@@ -2664,8 +2804,9 @@ int test_mweb_atomic_sign(void)
     test_input_commit_mismatch_rejects();
     test_input_commit_missing_rejects();
     test_input_commit_not_rewritten();
-    test_mweb_output_s2_binding_ok();
-    test_mweb_output_s2_tampered_commit_rejects();
+    test_mweb_output_build_and_commit_ok();
+    test_mweb_output_build_abort_restores_psbt();
+    test_mweb_output_build_ignores_host_offsets();
     test_has_mweb_gate_shapes();
     test_output_unknowns_restored_after_abort();
     test_output_unknowns_snapshot_empty_map();
@@ -2674,7 +2815,7 @@ int test_mweb_atomic_sign(void)
     test_kernel_stealth_excess_session_commit_ok();
     test_kernel_stealth_excess_trng_exhausts_to_internal();
 
-    printf("\nmweb_atomic_sign: 29 tests, %d failures\n", failures);
+    printf("\nmweb_atomic_sign: 30 tests, %d failures\n", failures);
     return failures;
 }
 

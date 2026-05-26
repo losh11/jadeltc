@@ -402,7 +402,7 @@ static bool test_mweb_sign_properties(void)
     mweb_input_state_t state_nobit;
     if (mweb_derive_input_state(MWEB_TEST_SCAN_KEY, MWEB_TEST_SPEND_KEY, 0,
             0x00, /* no stealth bit */
-            oid, Ko, 1000000, kex, &state_nobit) != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+            oid, Ko, 1000000, kex, &state_nobit) != MWEB_ERR_INVALID_SCALAR) {
         FAIL();
     }
 
@@ -724,7 +724,7 @@ static bool test_mweb_kernel_sign_stealth(void)
  * Exercises every policy-level failure code `mweb_sign_kernel_with_ek`
  * can return: zero/overflow scalars, feature-bit ↔ field presence
  * mismatches in both directions, the stealth-excess split between
- * MISSING_STEALTH_KEY and KERNEL_FEATURE_MISMATCH, and u64 balance
+ * MISSING_STEALTH_SCALAR and KERNEL_FEATURE_MISMATCH, and u64 balance
  * failures (including overflow).
  *
  * A regression that silently collapses two codes would only surface
@@ -766,15 +766,15 @@ static bool test_mweb_kernel_sign_errors(void)
             params.received_stealth_offset = ZERO;                        \
         } while (0)
 
-    /* 1. Zero e_k → INVALID_PRESIGN_SCALAR */
+    /* 1. Zero e_k → INVALID_SCALAR */
     BASE_PARAMS();
     if (mweb_sign_kernel_with_ek(ZERO, &params, &result)
-        != MWEB_ERR_INVALID_PRESIGN_SCALAR) { FAIL(); }
+        != MWEB_ERR_INVALID_SCALAR) { FAIL(); }
 
-    /* 2. e_k == n → INVALID_PRESIGN_SCALAR */
+    /* 2. e_k == n → INVALID_SCALAR */
     BASE_PARAMS();
     if (mweb_sign_kernel_with_ek(ORDER, &params, &result)
-        != MWEB_ERR_INVALID_PRESIGN_SCALAR) { FAIL(); }
+        != MWEB_ERR_INVALID_SCALAR) { FAIL(); }
 
     /* 3. Unbalanced (output > input+fee): BALANCE_FAIL */
     BASE_PARAMS();
@@ -834,14 +834,14 @@ static bool test_mweb_kernel_sign_errors(void)
     if (mweb_sign_kernel_with_ek(ONE, &params, &result)
         != MWEB_ERR_KERNEL_FEATURE_MISMATCH) { FAIL(); }
 
-    /* 11. StealthExcessBit set but stealth_key NULL: MISSING_STEALTH_KEY
+    /* 11. StealthExcessBit set but stealth_key NULL: MISSING_STEALTH_SCALAR
      *     (distinct from FEATURE_MISMATCH so the user-visible error
-     *     points at missing presign data, not a structural mismatch). */
+     *     points at a missing required scalar, not a structural mismatch). */
     BASE_PARAMS();
     params.features |= MWEB_KERNEL_STEALTH_EXCESS_BIT;
     params.stealth_key_or_null = NULL;
     if (mweb_sign_kernel_with_ek(ONE, &params, &result)
-        != MWEB_ERR_MISSING_STEALTH_KEY) { FAIL(); }
+        != MWEB_ERR_MISSING_STEALTH_SCALAR) { FAIL(); }
 
     /* 12. !StealthExcessBit but stealth_key present: FEATURE_MISMATCH
      *     (inverse direction — structural inconsistency, not a
@@ -851,12 +851,12 @@ static bool test_mweb_kernel_sign_errors(void)
     if (mweb_sign_kernel_with_ek(ONE, &params, &result)
         != MWEB_ERR_KERNEL_FEATURE_MISMATCH) { FAIL(); }
 
-    /* 13. Zero stealth_key: INVALID_PRESIGN_SCALAR */
+    /* 13. Zero stealth_key: INVALID_SCALAR */
     BASE_PARAMS();
     params.features |= MWEB_KERNEL_STEALTH_EXCESS_BIT;
     params.stealth_key_or_null = ZERO;
     if (mweb_sign_kernel_with_ek(ONE, &params, &result)
-        != MWEB_ERR_INVALID_PRESIGN_SCALAR) { FAIL(); }
+        != MWEB_ERR_INVALID_SCALAR) { FAIL(); }
 
     #undef BASE_PARAMS
     return true;
@@ -1156,7 +1156,7 @@ static bool test_mweb_derive_output_happy(void)
     /* Invalid-scalar rejection — sender_key == 0 rejected before any EC op. */
     static const uint8_t ZERO[32] = {0};
     if (mweb_derive_output(ZERO, OUT_SCAN_A, OUT_SPEND_B, OUT_VALUE, &got)
-        != MWEB_ERR_INVALID_PRESIGN_SCALAR) { FAIL(); }
+        != MWEB_ERR_INVALID_SCALAR) { FAIL(); }
 
     return true;
 }
@@ -1604,16 +1604,11 @@ static bool session_snapshots_equal(const session_snapshot_t *a,
 
 static bool run_rollback_on_reject(struct wally_psbt *psbt, struct wally_psbt_kernel *k)
 {
-    /* Seed with non-zero so "still zero" can't be a vacuous pass. */
-    psbt->has_mweb_tx_offset = 1;
-    memset(psbt->mweb_tx_offset, 0xA5, 32);
-    psbt->has_mweb_stealth_offset = 1;
-    memset(psbt->mweb_stealth_offset, 0x5A, 32);
-    k->has_excess_commitment = 1;
-    memset(k->excess_commitment, 0x11, 33);
-    k->has_signature = 1;
-    memset(k->signature, 0x22, 64);
-
+    /* The unsigned-PSBT shape: device-owned fields (tx_offset,
+     * stealth_offset, excess_commitment, signature) start absent.
+     * mweb_session_begin fails the balance check before any of these
+     * can be written, so byte-identity before/after asserts that
+     * begin took no partial-write path on the failure leg. */
     session_snapshot_t pre, post;
     snapshot_session_state(psbt, k, &pre);
 

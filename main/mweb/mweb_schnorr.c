@@ -231,7 +231,7 @@ mweb_err_t mweb_sign_output(
         return MWEB_ERR_INTERNAL;
     }
     if (!mweb_validate_scalar(sender_key)) {
-        return MWEB_ERR_INVALID_PRESIGN_SCALAR;
+        return MWEB_ERR_INVALID_SCALAR;
     }
 
     uint8_t sig_hash[32];

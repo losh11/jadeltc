@@ -425,8 +425,8 @@ static void test_missing_stealth_bit(void)
     mweb_err_t err = mweb_derive_input_state(SCAN_KEY, SPEND_KEY, 0,
         0x00, /* no stealth bit */
         oid, Ko, 1000000, kex, &state);
-    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
-        printf("FAIL: missing_stealth — expected INVALID_PRESIGN_SCALAR, got %d\n", err);
+    if (err != MWEB_ERR_INVALID_SCALAR) {
+        printf("FAIL: missing_stealth — expected INVALID_SCALAR, got %d\n", err);
         failures++;
         return;
     }

@@ -137,8 +137,8 @@ static void test_invalid_scalar(void)
                                         OUT_HAPPY_SPEND_B,
                                         OUT_HAPPY_VALUE,
                                         &got);
-    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
-        FAIL("invalid_scalar/zero", "expected INVALID_PRESIGN_SCALAR, got %d", err);
+    if (err != MWEB_ERR_INVALID_SCALAR) {
+        FAIL("invalid_scalar/zero", "expected INVALID_SCALAR, got %d", err);
         return;
     }
 
@@ -154,8 +154,8 @@ static void test_invalid_scalar(void)
                              OUT_HAPPY_SPEND_B,
                              OUT_HAPPY_VALUE,
                              &got);
-    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
-        FAIL("invalid_scalar/n", "expected INVALID_PRESIGN_SCALAR, got %d", err);
+    if (err != MWEB_ERR_INVALID_SCALAR) {
+        FAIL("invalid_scalar/n", "expected INVALID_SCALAR, got %d", err);
         return;
     }
 
@@ -171,8 +171,8 @@ static void test_invalid_scalar(void)
                              OUT_HAPPY_SPEND_B,
                              OUT_HAPPY_VALUE,
                              &got);
-    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
-        FAIL("invalid_scalar/n+1", "expected INVALID_PRESIGN_SCALAR, got %d", err);
+    if (err != MWEB_ERR_INVALID_SCALAR) {
+        FAIL("invalid_scalar/n+1", "expected INVALID_SCALAR, got %d", err);
         return;
     }
 
@@ -830,7 +830,7 @@ static void test_build_features_change_proof(void)
     PASS("build_features_change_proof");
 }
 
-/* Test 9: invalid sender_key → MWEB_ERR_INVALID_PRESIGN_SCALAR. */
+/* Test 9: invalid sender_key → MWEB_ERR_INVALID_SCALAR. */
 static void test_build_invalid_sender_key(void)
 {
     static const uint8_t ZERO[32] = {0};
@@ -839,8 +839,8 @@ static void test_build_invalid_sender_key(void)
         ZERO, OUT_HAPPY_SCAN_A, OUT_HAPPY_SPEND_B,
         OUT_HAPPY_VALUE, MWEB_OUTPUT_STANDARD_FIELDS_BIT,
         NULL, 0, BP_NONCE, BP_PRIVATE_NONCE, &built);
-    if (err != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
-        FAIL("build_invalid_sender_key", "expected INVALID_PRESIGN_SCALAR, got %d", (int)err);
+    if (err != MWEB_ERR_INVALID_SCALAR) {
+        FAIL("build_invalid_sender_key", "expected INVALID_SCALAR, got %d", (int)err);
         return;
     }
     PASS("build_invalid_sender_key");
@@ -1041,7 +1041,7 @@ static void test_build_failure_zeroes_built(void)
             ZERO, OUT_HAPPY_SCAN_A, OUT_HAPPY_SPEND_B,
             OUT_HAPPY_VALUE, MWEB_OUTPUT_STANDARD_FIELDS_BIT,
             NULL, 0, BP_NONCE, BP_PRIVATE_NONCE, &built)
-        != MWEB_ERR_INVALID_PRESIGN_SCALAR) {
+        != MWEB_ERR_INVALID_SCALAR) {
         FAIL("build_failure_zeroes_built", "(a) wrong error");
         return;
     }
