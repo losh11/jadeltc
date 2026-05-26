@@ -38,6 +38,13 @@ typedef enum {
  */
 bool mweb_validate_scalar(const uint8_t s[32]);
 
+/* ── Wire serialization ──────────────────────────────────────────────── */
+
+/* Write a Bitcoin compact-size varint to buf, returning bytes written
+ * (1, 3, 5, or 9). buf must have room for up to 9 bytes. Shared between
+ * the kernel hash and the MWEB output message serializer. */
+size_t mweb_write_compact_size(uint8_t *buf, uint64_t val);
+
 /* ── Kernel feature bits ─────────────────────────────────────────────── */
 
 #define MWEB_KERNEL_FEE_BIT              0x01

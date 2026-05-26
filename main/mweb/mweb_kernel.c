@@ -37,7 +37,7 @@ bool mweb_validate_scalar(const uint8_t s[32])
 }
 
 /* Bitcoin compact-size varint */
-static size_t write_compact_size(uint8_t *buf, uint64_t val)
+size_t mweb_write_compact_size(uint8_t *buf, uint64_t val)
 {
     if (val < 0xfd) {
         buf[0] = (uint8_t)val;
@@ -180,7 +180,7 @@ bool mweb_kernel_sig_hash(
         size_t count = pegouts ? pegouts->num_items : 0;
 
         /* pegout count — Bitcoin compact-size varint */
-        vi_len = write_compact_size(vi, (uint64_t)count);
+        vi_len = mweb_write_compact_size(vi, (uint64_t)count);
         blake3_hasher_update(&hasher, vi, vi_len);
 
         for (size_t i = 0; i < count; i++) {
@@ -199,7 +199,7 @@ bool mweb_kernel_sig_hash(
             blake3_hasher_update(&hasher, vi, vi_len);
 
             /* pkScript — Bitcoin compact-size length + bytes */
-            vi_len = write_compact_size(vi, (uint64_t)script_len);
+            vi_len = mweb_write_compact_size(vi, (uint64_t)script_len);
             blake3_hasher_update(&hasher, vi, vi_len);
             if (script_len > 0) {
                 blake3_hasher_update(&hasher, script, script_len);
@@ -223,7 +223,7 @@ bool mweb_kernel_sig_hash(
      * which emits a compact-size 0x00 even for nil/empty extra data. */
     if (features & MWEB_KERNEL_EXTRA_DATA_BIT) {
         size_t elen = extra_data ? extra_data_len : 0;
-        vi_len = write_compact_size(vi, (uint64_t)elen);
+        vi_len = mweb_write_compact_size(vi, (uint64_t)elen);
         blake3_hasher_update(&hasher, vi, vi_len);
         if (extra_data && extra_data_len > 0) {
             blake3_hasher_update(&hasher, extra_data, extra_data_len);
