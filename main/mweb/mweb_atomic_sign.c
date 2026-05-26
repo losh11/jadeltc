@@ -28,6 +28,7 @@
 #include "mweb_keychain.h"
 
 #include "../utils/network.h"
+#include "../random.h"
 #include "../sensitive.h"
 #include "../wallet.h"
 
@@ -987,25 +988,35 @@ mweb_err_t mweb_session_begin(
         goto fail;
     }
 
-    {
-        size_t written = 0;
-        if (wally_psbt_kernel_get_mweb_presign_stealth_key(kernel,
-                stealth_key, sizeof(stealth_key), &written) == WALLY_OK
-            && written == 32) {
-            has_stealth_key = true;
+    /*
+     * Stealth-excess kernels need a fresh secret scalar to tweak the
+     * Schnorr signing key and offset the stealth side of the balance.
+     * Drawn from the device TRNG with an 8-retry budget against
+     * mweb_validate_scalar (rejects zero and >= curve order n); the
+     * retry envelope mirrors e_k in mweb_kernel.c. The rejection band
+     * is roughly 2^128 of the 2^256 byte space, so eight consecutive
+     * out-of-range draws on a healthy TRNG is vanishingly unlikely —
+     * exhaustion is treated as a hardware fault and surfaced as INTERNAL.
+     */
+    if (se_bit) {
+#ifndef AMALGAMATED_BUILD
+        SENSITIVE_PUSH(stealth_key, sizeof(stealth_key));
+#endif
+        for (int tries = 0; tries < 8; ++tries) {
+            get_random(stealth_key, sizeof(stealth_key));
+            if (mweb_validate_scalar(stealth_key)) {
+                has_stealth_key = true;
+                break;
+            }
         }
-    }
-    if (se_bit && !has_stealth_key) {
-        err = MWEB_ERR_MISSING_STEALTH_KEY;
-        goto fail;
-    }
-    if (!se_bit && has_stealth_key) {
-        err = MWEB_ERR_KERNEL_FEATURE_MISMATCH;
-        goto fail;
-    }
-    if (has_stealth_key && !mweb_validate_scalar(stealth_key)) {
-        err = MWEB_ERR_INVALID_PRESIGN_SCALAR;
-        goto fail;
+        if (!has_stealth_key) {
+            wally_bzero(stealth_key, sizeof(stealth_key));
+#ifndef AMALGAMATED_BUILD
+            SENSITIVE_POP(stealth_key);
+#endif
+            err = MWEB_ERR_INTERNAL;
+            goto fail;
+        }
     }
     s->kernel.has_stealth_excess = se_bit;
 
@@ -1275,12 +1286,22 @@ mweb_err_t mweb_session_begin(
         wally_bzero(&ko, sizeof(ko));
     }
 
-    wally_bzero(stealth_key, 32);
+    wally_bzero(stealth_key, sizeof(stealth_key));
+#ifndef AMALGAMATED_BUILD
+    if (has_stealth_key) {
+        SENSITIVE_POP(stealth_key);
+    }
+#endif
     *out_session = s;
     return MWEB_OK;
 
 fail:
-    wally_bzero(stealth_key, 32);
+    wally_bzero(stealth_key, sizeof(stealth_key));
+#ifndef AMALGAMATED_BUILD
+    if (has_stealth_key) {
+        SENSITIVE_POP(stealth_key);
+    }
+#endif
     mweb_session_abort(s, psbt);
     return err;
 }

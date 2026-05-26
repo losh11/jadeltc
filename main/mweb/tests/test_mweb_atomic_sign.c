@@ -481,9 +481,10 @@ static void run_kernel_reject_case(const char *tag,
 
 /* Feature bits mirror main/mweb/mweb_kernel.h. Copied locally so the test
  * is independent of that header's include chain. */
-#define MWEB_TEST_FEE_BIT    0x01
-#define MWEB_TEST_PEGIN_BIT  0x02
-#define MWEB_TEST_PEGOUT_BIT 0x04
+#define MWEB_TEST_FEE_BIT             0x01
+#define MWEB_TEST_PEGIN_BIT           0x02
+#define MWEB_TEST_PEGOUT_BIT          0x04
+#define MWEB_TEST_STEALTH_EXCESS_BIT  0x10
 
 static void prep_fee_out_of_range(struct wally_psbt_kernel *k)
 {
@@ -2475,6 +2476,169 @@ static void test_output_unknowns_integer_keys_restored_after_abort(void)
     else failures++;
 }
 
+/* ── Stealth-excess kernel TRNG path ────────────────────────────────── */
+
+/*
+ * Happy path: a stealth-excess kernel signs end-to-end. With the TRNG
+ * stub seeded non-zero, the on-device stealth-key draw passes
+ * mweb_validate_scalar on the first try and the kernel signer produces
+ * a populated stealth_excess pubkey, a non-zero signature, and a
+ * stealth_offset_final the commit pass writes into the PSBT.
+ *
+ * Note this asserts only invariants (pubkey prefix, signature non-zero,
+ * field presence); byte-equal pinning lives in the kernel-level
+ * selfcheck (mweb_selfcheck.c), which calls mweb_sign_kernel_with_ek
+ * directly with a fixed stealth_key.
+ */
+static void test_kernel_stealth_excess_session_commit_ok(void)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 0, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: stealth_excess_ok — wally_psbt_init_alloc\n");
+        failures++;
+        return;
+    }
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    prep_valid_fee_only(&kernel);
+    kernel.features |= MWEB_TEST_STEALTH_EXCESS_BIT;
+
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0;
+
+    seed_trng_nonzero(0x42);
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    bool ok = true;
+    if (err != MWEB_OK) {
+        printf("FAIL: stealth_excess_ok — begin returned %d\n", err);
+        ok = false;
+    } else if (!s) {
+        printf("FAIL: stealth_excess_ok — session was NULL on success\n");
+        ok = false;
+    }
+
+    if (ok) {
+        err = mweb_session_commit(s, psbt);
+        if (err != MWEB_OK) {
+            printf("FAIL: stealth_excess_ok — commit returned %d\n", err);
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        if (!kernel.has_stealth_excess) {
+            printf("FAIL: stealth_excess_ok — has_stealth_excess not set\n");
+            ok = false;
+        }
+        if (ok && kernel.stealth_excess[0] != 0x02
+               && kernel.stealth_excess[0] != 0x03) {
+            printf("FAIL: stealth_excess_ok — stealth_excess prefix 0x%02x\n",
+                   kernel.stealth_excess[0]);
+            ok = false;
+        }
+        if (ok && !kernel.has_signature) {
+            printf("FAIL: stealth_excess_ok — has_signature not set\n");
+            ok = false;
+        }
+        uint8_t zero_sig[64] = {0};
+        if (ok && memcmp(kernel.signature, zero_sig, 64) == 0) {
+            printf("FAIL: stealth_excess_ok — signature is all-zero\n");
+            ok = false;
+        }
+        if (ok && !psbt->has_mweb_stealth_offset) {
+            printf("FAIL: stealth_excess_ok — has_mweb_stealth_offset not set\n");
+            ok = false;
+        }
+        uint8_t zero_off[32] = {0};
+        if (ok && memcmp(psbt->mweb_stealth_offset, zero_off, 32) == 0) {
+            printf("FAIL: stealth_excess_ok — stealth_offset is all-zero\n");
+            ok = false;
+        }
+    }
+
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+    wally_psbt_free(psbt);
+
+    if (ok) {
+        printf("PASS: kernel_stealth_excess_session_commit_ok\n");
+    } else {
+        failures++;
+    }
+}
+
+/*
+ * TRNG exhaustion. With the stub returning all-zero bytes for every
+ * get_random() call, mweb_validate_scalar rejects the draw (zero scalar
+ * is out of [1, n-1]) on every retry. After eight failed attempts the
+ * stealth-key path returns MWEB_ERR_INTERNAL — never reaching the
+ * kernel-signer's own e_k draw — and out_session stays NULL so the
+ * caller is not handed a partial session.
+ */
+static void test_kernel_stealth_excess_trng_exhausts_to_internal(void)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 0, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: stealth_excess_trng_exhaust — wally_psbt_init_alloc\n");
+        failures++;
+        return;
+    }
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    prep_valid_fee_only(&kernel);
+    kernel.features |= MWEB_TEST_STEALTH_EXCESS_BIT;
+
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0;
+
+    psbt_mweb_snapshot_t pre;
+    snapshot_psbt_mweb(psbt, &kernel, &pre);
+
+    /* All-zero TRNG: every mweb_validate_scalar call returns false. */
+    memset(g_test_random, 0, sizeof(g_test_random));
+
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    bool ok = true;
+    if (err != MWEB_ERR_INTERNAL) {
+        printf("FAIL: stealth_excess_trng_exhaust — expected INTERNAL got %d\n", err);
+        ok = false;
+    }
+    if (s != NULL) {
+        printf("FAIL: stealth_excess_trng_exhaust — out_session not NULL on reject\n");
+        ok = false;
+    }
+
+    /* Reject must not leave any PSBT field touched. */
+    psbt_mweb_snapshot_t post;
+    snapshot_psbt_mweb(psbt, &kernel, &post);
+    if (ok && !snapshots_equal(&pre, &post)) {
+        printf("FAIL: stealth_excess_trng_exhaust — reject mutated PSBT\n");
+        ok = false;
+    }
+
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+    wally_psbt_free(psbt);
+
+    if (ok) {
+        printf("PASS: kernel_stealth_excess_trng_exhausts_to_internal\n");
+    } else {
+        failures++;
+    }
+}
+
 int test_mweb_atomic_sign(void)
 {
     failures = 0;
@@ -2507,8 +2671,10 @@ int test_mweb_atomic_sign(void)
     test_output_unknowns_snapshot_empty_map();
     test_output_unknowns_multi_output_independence();
     test_output_unknowns_integer_keys_restored_after_abort();
+    test_kernel_stealth_excess_session_commit_ok();
+    test_kernel_stealth_excess_trng_exhausts_to_internal();
 
-    printf("\nmweb_atomic_sign: 27 tests, %d failures\n", failures);
+    printf("\nmweb_atomic_sign: 29 tests, %d failures\n", failures);
     return failures;
 }
 
