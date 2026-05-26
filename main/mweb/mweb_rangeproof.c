@@ -78,6 +78,14 @@ mweb_err_t mweb_build_rangeproof_with_nonces(
         return MWEB_ERR_INTERNAL;
     }
 
+    /* Per-prove scratch caps the lifetime of the in-scratch copy of `blind`
+     * to a single prove call. secp's destroy frees the buffer without
+     * zeroing it (scratch_impl.h's secp256k1_scratch_destroy only clears
+     * the 8-byte magic before free), so residue persists in the freed
+     * heap block until the allocator reuses that region — typically the
+     * next prove call in a multi-output session. A future fix is an
+     * upstream `secp256k1_scratch_wipe()` API; until then this is the
+     * tightest bound public-API consumers can achieve. */
     secp256k1_scratch_space *scratch = secp256k1_scratch_space_create(
         ctx, MWEB_BP_SCRATCH_BYTES);
     if (!scratch) {

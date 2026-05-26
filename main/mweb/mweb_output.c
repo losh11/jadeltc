@@ -83,6 +83,18 @@ static mweb_err_t derive_output_binding(
     uint8_t mask_blind[32];
     uint8_t tag_hash[32];
 
+    /* Hoisted out of inner blocks so cleanup can wipe them — secp256k1_pubkey
+     * holds the parsed point internally, including A_pk's sA shared-secret
+     * and the intermediate B_pk values multiplied by secret scalars. */
+    secp256k1_pubkey A_pk;
+    secp256k1_pubkey B_pk_Ko;
+    secp256k1_pubkey B_pk_Ke;
+    secp256k1_pubkey Ks_pk;
+    memset(&A_pk,    0, sizeof(A_pk));
+    memset(&B_pk_Ko, 0, sizeof(B_pk_Ko));
+    memset(&B_pk_Ke, 0, sizeof(B_pk_Ke));
+    memset(&Ks_pk,   0, sizeof(Ks_pk));
+
     /* Step 2: n_16 = Hashed('N', sender_key)[0..16] */
     mweb_hashed(MWEB_TAG_NONCE, sender_key, 32, n_hash);
     memcpy(n_16, n_hash, 16);
@@ -97,14 +109,13 @@ static mweb_err_t derive_output_binding(
     mweb_hashed(MWEB_TAG_SENDKEY, s_input, sizeof(s_input), s);
 
     /* Step 4: sA = s * A. Negligible-probability failure on s==0 or s>=n. */
+    if (!secp256k1_ec_pubkey_parse(ctx, &A_pk, scan_pub_A, 33)) {
+        goto cleanup;
+    }
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &A_pk, s)) {
+        goto cleanup;
+    }
     {
-        secp256k1_pubkey A_pk;
-        if (!secp256k1_ec_pubkey_parse(ctx, &A_pk, scan_pub_A, 33)) {
-            goto cleanup;
-        }
-        if (!secp256k1_ec_pubkey_tweak_mul(ctx, &A_pk, s)) {
-            goto cleanup;
-        }
         size_t len = 33;
         secp256k1_ec_pubkey_serialize(ctx, sA, &len, &A_pk,
                                       SECP256K1_EC_COMPRESSED);
@@ -115,31 +126,29 @@ static mweb_err_t derive_output_binding(
 
     /* Step 6: K_o = Hashed('O', t) * B. */
     mweb_hashed(MWEB_TAG_OUTKEY, t, 32, o_scalar);
+    if (!secp256k1_ec_pubkey_parse(ctx, &B_pk_Ko, spend_pub_B, 33)) {
+        goto cleanup;
+    }
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &B_pk_Ko, o_scalar)) {
+        goto cleanup;
+    }
     {
-        secp256k1_pubkey B_pk;
-        if (!secp256k1_ec_pubkey_parse(ctx, &B_pk, spend_pub_B, 33)) {
-            goto cleanup;
-        }
-        if (!secp256k1_ec_pubkey_tweak_mul(ctx, &B_pk, o_scalar)) {
-            goto cleanup;
-        }
         size_t len = 33;
-        secp256k1_ec_pubkey_serialize(ctx, out->output_pubkey, &len, &B_pk,
+        secp256k1_ec_pubkey_serialize(ctx, out->output_pubkey, &len, &B_pk_Ko,
                                       SECP256K1_EC_COMPRESSED);
     }
 
     /* Step 7: K_e = s * B (NOT sender_key * A). */
+    if (!secp256k1_ec_pubkey_parse(ctx, &B_pk_Ke, spend_pub_B, 33)) {
+        goto cleanup;
+    }
+    if (!secp256k1_ec_pubkey_tweak_mul(ctx, &B_pk_Ke, s)) {
+        goto cleanup;
+    }
     {
-        secp256k1_pubkey B_pk;
-        if (!secp256k1_ec_pubkey_parse(ctx, &B_pk, spend_pub_B, 33)) {
-            goto cleanup;
-        }
-        if (!secp256k1_ec_pubkey_tweak_mul(ctx, &B_pk, s)) {
-            goto cleanup;
-        }
         size_t len = 33;
         secp256k1_ec_pubkey_serialize(ctx, out->key_exchange_pubkey, &len,
-                                      &B_pk, SECP256K1_EC_COMPRESSED);
+                                      &B_pk_Ke, SECP256K1_EC_COMPRESSED);
     }
 
     /* Step 8: derive the OutputMask tuple from the shared secret t. */
@@ -173,11 +182,10 @@ static mweb_err_t derive_output_binding(
     }
 
     /* Step 13: K_s = sender_key * G. */
+    if (!secp256k1_ec_pubkey_create(ctx, &Ks_pk, sender_key)) {
+        goto cleanup;
+    }
     {
-        secp256k1_pubkey Ks_pk;
-        if (!secp256k1_ec_pubkey_create(ctx, &Ks_pk, sender_key)) {
-            goto cleanup;
-        }
         size_t len = 33;
         secp256k1_ec_pubkey_serialize(ctx, out->sender_pubkey, &len, &Ks_pk,
                                       SECP256K1_EC_COMPRESSED);
@@ -202,6 +210,10 @@ cleanup:
     wally_bzero(nonce_mask_16, sizeof(nonce_mask_16));
     wally_bzero(mask_blind,    sizeof(mask_blind));
     wally_bzero(tag_hash,      sizeof(tag_hash));
+    wally_bzero(&A_pk,    sizeof(A_pk));     /* held sA shared-secret point */
+    wally_bzero(&B_pk_Ko, sizeof(B_pk_Ko));  /* derived via secret o_scalar */
+    wally_bzero(&B_pk_Ke, sizeof(B_pk_Ke));  /* derived via secret s */
+    wally_bzero(&Ks_pk,   sizeof(Ks_pk));    /* derived via secret sender_key */
     return err;
 }
 
