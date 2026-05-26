@@ -10,6 +10,7 @@ idf_component_register(SRCS
                        "upstream/src/secp256k1"
                        "upstream/src/secp256k1/src"
                        "upstream/src/secp256k1/include"
+                       "upstream/src/secp256k1/src/modules/bulletproofs"
                        "upstream/src/secp256k1/src/modules/ecdh"
                        "upstream/src/secp256k1/src/modules/ecdsa_adaptor"
                        "upstream/src/secp256k1/src/modules/ecdsa_s2c"
@@ -47,6 +48,7 @@ target_compile_definitions(${COMPONENT_TARGET} PRIVATE "-DHAVE_MBEDTLS_SHA512_H"
 
 # libsecp flags
 target_compile_definitions(${COMPONENT_TARGET} PRIVATE "-DECMULT_WINDOW_SIZE=8")
+target_compile_definitions(${COMPONENT_TARGET} PRIVATE "-DENABLE_MODULE_BULLETPROOF=1")
 target_compile_definitions(${COMPONENT_TARGET} PRIVATE "-DENABLE_MODULE_ECDH=1")
 target_compile_definitions(${COMPONENT_TARGET} PRIVATE "-DENABLE_MODULE_ECDSA_S2C=1")
 target_compile_definitions(${COMPONENT_TARGET} PRIVATE "-DENABLE_MODULE_EXTRAKEYS=1")
