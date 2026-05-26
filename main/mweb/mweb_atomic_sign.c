@@ -176,6 +176,34 @@ typedef struct {
     wally_map_snapshot_t taproot_leaf_signatures;
 } std_input_snapshot_t;
 
+/*
+ * Per-output rollback snapshot.
+ *
+ * Captures the state that `mweb_session_abort` must restore on a
+ * per-output basis to keep the PSBT byte-identical to its begin-entry
+ * state:
+ *   - `unknowns` — the entire wally_map, deep-cloned. Any keys
+ *     inserted or replaced between begin and abort are unwound by
+ *     the pointer-swap restore, regardless of which proprietary
+ *     keys are touched.
+ *   - `mweb_output_keyset` — the duplicate-tracking bitset, copied
+ *     wholesale. Restored to its begin-entry value so the bitset
+ *     stays consistent with the map contents after the swap.
+ *
+ * `unknowns.valid` gates the composite as a whole: if the map clone
+ * fails we leave both fields untouched at restore time so a partially-
+ * captured snapshot cannot truncate a live map. The keyset copy has
+ * no failure mode of its own, so a separate composite flag would just
+ * shadow `unknowns.valid` without adding information.
+ *
+ * One slot per `psbt->outputs[]` index so the abort path can address by
+ * raw output index regardless of which outputs are MWEB-shaped.
+ */
+typedef struct {
+    wally_map_snapshot_t unknowns;
+    uint16_t             mweb_output_keyset;
+} mweb_output_snapshot_t;
+
 struct mweb_session {
     session_input_t  *inputs;
     size_t            n_inputs;
@@ -209,6 +237,14 @@ struct mweb_session {
      */
     std_input_snapshot_t *std_input_snapshots;
     size_t                n_std_input_snapshots;
+
+    /*
+     * Per-PSBT-output unknowns + mweb_output_keyset snapshot. One entry
+     * per psbt->outputs[]. NULL when mweb_session_begin() failed before
+     * the snapshot array was allocated.
+     */
+    mweb_output_snapshot_t *mweb_output_snapshots;
+    size_t                  n_mweb_output_snapshots;
 };
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
@@ -515,6 +551,50 @@ static void restore_std_input(std_input_snapshot_t *snap,
     restore_wally_map(&snap->taproot_leaf_signatures, &in->taproot_leaf_signatures);
 }
 
+/* ── Per-output snapshot ──────────────────────────────────────────── */
+
+static void free_mweb_output_snapshot(mweb_output_snapshot_t *snap)
+{
+    if (!snap) return;
+    free_wally_map_snapshot(&snap->unknowns);
+    memset(snap, 0, sizeof(*snap));
+}
+
+/*
+ * Clone an output's `unknowns` map and record its `mweb_output_keyset`.
+ * Returns false on OOM during the clone; in that case
+ * `snap->unknowns.valid` is left false and restore is a no-op. The
+ * keyset is copied unconditionally — it's only meaningful when the
+ * paired map clone succeeded, and `restore_mweb_output` gates on
+ * `unknowns.valid` before reading it.
+ */
+static bool snapshot_mweb_output(mweb_output_snapshot_t *snap,
+                                  const struct wally_psbt_output *po)
+{
+    memset(snap, 0, sizeof(*snap));
+    if (!po) return true; /* no output; no-op snapshot */
+
+    if (!snapshot_wally_map(&snap->unknowns, &po->unknowns)) {
+        return false;
+    }
+    snap->mweb_output_keyset = po->mweb_output_keyset;
+    return true;
+}
+
+/*
+ * Swap the cloned `unknowns` back into place and restore the
+ * begin-entry `mweb_output_keyset`. No-op if the snapshot was never
+ * captured (e.g. begin failed before the array was populated) so a
+ * half-built snapshot array cannot clobber live state.
+ */
+static void restore_mweb_output(mweb_output_snapshot_t *snap,
+                                 struct wally_psbt_output *po)
+{
+    if (!snap || !po || !snap->unknowns.valid) return;
+    po->mweb_output_keyset = snap->mweb_output_keyset;
+    restore_wally_map(&snap->unknowns, &po->unknowns);
+}
+
 /* ── Destroy ──────────────────────────────────────────────────────────── */
 
 static void session_free(struct mweb_session *s)
@@ -539,6 +619,12 @@ static void session_free(struct mweb_session *s)
             free_std_input_snapshot(&s->std_input_snapshots[i]);
         }
         free(s->std_input_snapshots);
+    }
+    if (s->mweb_output_snapshots) {
+        for (size_t i = 0; i < s->n_mweb_output_snapshots; i++) {
+            free_mweb_output_snapshot(&s->mweb_output_snapshots[i]);
+        }
+        free(s->mweb_output_snapshots);
     }
     wally_bzero(&s->kernel, sizeof(s->kernel));
     wally_bzero(s, sizeof(*s));
@@ -569,6 +655,13 @@ void mweb_session_abort(mweb_session_t *s, struct wally_psbt *psbt)
          * snapshot array cannot clobber live maps. */
         for (size_t i = 0; i < s->n_std_input_snapshots && i < psbt->num_inputs; i++) {
             restore_std_input(&s->std_input_snapshots[i], &psbt->inputs[i]);
+        }
+        /* Restore each output's `unknowns` map and `mweb_output_keyset`
+         * to their begin-entry state. Same guarantees as the input
+         * restore loop above: pure pointer swap, can't fail at rollback
+         * time, !valid snapshots are no-ops. */
+        for (size_t i = 0; i < s->n_mweb_output_snapshots && i < psbt->num_outputs; i++) {
+            restore_mweb_output(&s->mweb_output_snapshots[i], &psbt->outputs[i]);
         }
     }
     session_free(s);
@@ -827,6 +920,28 @@ mweb_err_t mweb_session_begin(
         for (size_t i = 0; i < psbt->num_inputs; i++) {
             if (!snapshot_std_input(&s->std_input_snapshots[i],
                     &psbt->inputs[i])) {
+                mweb_session_abort(s, psbt);
+                return MWEB_ERR_INTERNAL;
+            }
+        }
+    }
+
+    /* Per-output unknowns + mweb_output_keyset snapshot. One slot per
+     * psbt->outputs[] index so the abort path can restore by raw
+     * output index regardless of which outputs are MWEB-shaped.
+     * Allocating at begin guarantees the pointer-swap restore at
+     * abort cannot fail. */
+    if (psbt->num_outputs > 0) {
+        s->mweb_output_snapshots = calloc(psbt->num_outputs,
+                                           sizeof(s->mweb_output_snapshots[0]));
+        if (!s->mweb_output_snapshots) {
+            mweb_session_abort(s, psbt);
+            return MWEB_ERR_INTERNAL;
+        }
+        s->n_mweb_output_snapshots = psbt->num_outputs;
+        for (size_t i = 0; i < psbt->num_outputs; i++) {
+            if (!snapshot_mweb_output(&s->mweb_output_snapshots[i],
+                    &psbt->outputs[i])) {
                 mweb_session_abort(s, psbt);
                 return MWEB_ERR_INTERNAL;
             }

@@ -1980,6 +1980,501 @@ static void test_has_mweb_gate_shapes(void)
 #undef GATE_OUT_STEALTH_BIT
 #undef GATE_OUT_COMMIT_BIT
 
+/*
+ * ── Per-output unknowns + mweb_output_keyset rollback ──────────────────
+ *
+ * mweb_session_begin clones every output's `unknowns` map and stashes
+ * `mweb_output_keyset` into the session arena; mweb_session_abort swaps
+ * them back via a pointer exchange. No production code path writes to
+ * either field today, so the tests mutate the live state directly
+ * between begin and abort to exercise the snapshot/restore path, then
+ * assert byte-identical restoration. A non-MWEB output keyset (no
+ * STEALTH_ADDRESS / COMMIT bits) is used so the verify_mweb_output
+ * loop skips the output — begin reaches the snapshot phase, completes
+ * kernel signing, and hands back a valid session that abort can tear
+ * down.
+ */
+
+/* Mirrors production MWEB_OUT_BIT (the .c-local macro). Re-declared
+ * test-side because the production header doesn't export it. */
+#define TEST_MWEB_OUT_BIT(k) ((uint16_t)(1u << ((k) - 0x90)))
+
+static bool wally_maps_byte_equal(const struct wally_map *a,
+                                   const struct wally_map *b)
+{
+    if (!a || !b) return false;
+    if (a->num_items != b->num_items) return false;
+    for (size_t i = 0; i < a->num_items; i++) {
+        const struct wally_map_item *ai = &a->items[i];
+        const struct wally_map_item *bi = &b->items[i];
+        /* libwally encodes integer keys as `key == NULL` with the key
+         * value stored in `key_len`, and byte keys as `key != NULL`
+         * with the byte length in `key_len`. The two forms are not
+         * interchangeable, so a difference in key shape is itself an
+         * inequality. */
+        if ((ai->key == NULL) != (bi->key == NULL)) return false;
+        if (ai->key_len   != bi->key_len)   return false;
+        if (ai->value_len != bi->value_len) return false;
+        /* For integer keys both `ai->key` and `bi->key` are NULL;
+         * the `key_len` equality above already proved the integer
+         * keys match, so no key-byte compare is needed. */
+        if (ai->key != NULL && memcmp(ai->key, bi->key, ai->key_len) != 0) return false;
+        if (ai->value_len && memcmp(ai->value, bi->value, ai->value_len) != 0) return false;
+    }
+    return true;
+}
+
+static void test_output_unknowns_restored_after_abort(void)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 1, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: out_unknowns_restored — wally_psbt_init_alloc\n");
+        failures++;
+        return;
+    }
+    psbt->num_outputs = 1;
+
+    /* Pre-populate output[0].unknowns with two arbitrary entries. The
+     * key choices (0x92, 0x98) are deliberately outside the
+     * STEALTH_ADDRESS / COMMIT pair that MWEB_OUT_IS_MWEB looks at, so
+     * the begin-time output loop skips verify_mweb_output and the
+     * session reaches the snapshot phase + kernel sign on a fee-only
+     * kernel. */
+    if (wally_map_init(2, NULL, &psbt->outputs[0].unknowns) != WALLY_OK) {
+        printf("FAIL: out_unknowns_restored — wally_map_init\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    const uint8_t k_a = 0x92;
+    const uint8_t k_b = 0x98;
+    const uint8_t v_a[5] = { 'a','l','p','h','a' };
+    const uint8_t v_b[4] = { 'b','e','t','a' };
+    if (wally_map_add(&psbt->outputs[0].unknowns, &k_a, 1, v_a, sizeof(v_a)) != WALLY_OK
+        || wally_map_add(&psbt->outputs[0].unknowns, &k_b, 1, v_b, sizeof(v_b)) != WALLY_OK) {
+        printf("FAIL: out_unknowns_restored — wally_map_add\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    /* FEATURES bit (0x92) — non-MWEB-trigger so verify_mweb_output is skipped. */
+    const uint16_t expected_keyset = TEST_MWEB_OUT_BIT(0x92);
+    psbt->outputs[0].mweb_output_keyset = expected_keyset;
+    psbt->outputs[0].has_amount = 1;
+    psbt->outputs[0].amount = 0;
+
+    /* Independent deep clone of the live map for post-abort comparison. */
+    struct wally_map expected;
+    memset(&expected, 0, sizeof(expected));
+    if (wally_map_init(2, NULL, &expected) != WALLY_OK
+        || wally_map_combine(&expected, &psbt->outputs[0].unknowns) != WALLY_OK) {
+        printf("FAIL: out_unknowns_restored — clone expected\n");
+        failures++;
+        wally_map_clear(&expected);
+        wally_psbt_free(psbt);
+        return;
+    }
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    prep_valid_fee_only(&kernel);
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0;
+
+    seed_trng_nonzero(0x42);
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    bool ok = true;
+    if (err != MWEB_OK || !s) {
+        printf("FAIL: out_unknowns_restored — begin returned %d\n", err);
+        ok = false;
+    }
+
+    /* Append a new entry to the live map and flip an unrelated bit
+     * in the keyset; abort must undo both. */
+    if (ok) {
+        const uint8_t k_new = 0x96;
+        const uint8_t v_new[3] = { 'n','e','w' };
+        if (wally_map_add(&psbt->outputs[0].unknowns, &k_new, 1, v_new, sizeof(v_new))
+                != WALLY_OK) {
+            printf("FAIL: out_unknowns_restored — wally_map_add on live\n");
+            ok = false;
+        }
+        psbt->outputs[0].mweb_output_keyset |= TEST_MWEB_OUT_BIT(0x96);
+    }
+
+    /* Sanity: the mutation IS observable pre-abort. If this assertion
+     * fires, the test itself is broken (e.g. the live map and the
+     * expected clone are aliased somehow). */
+    if (ok && wally_maps_byte_equal(&psbt->outputs[0].unknowns, &expected)) {
+        printf("FAIL: out_unknowns_restored — live mutation invisible (test bug)\n");
+        ok = false;
+    }
+    if (ok && psbt->outputs[0].mweb_output_keyset == expected_keyset) {
+        printf("FAIL: out_unknowns_restored — keyset mutation invisible (test bug)\n");
+        ok = false;
+    }
+
+    mweb_session_abort(s, psbt);
+    s = NULL;
+
+    if (ok && !wally_maps_byte_equal(&psbt->outputs[0].unknowns, &expected)) {
+        printf("FAIL: out_unknowns_restored — abort did not restore unknowns\n");
+        ok = false;
+    }
+    if (ok && psbt->outputs[0].mweb_output_keyset != expected_keyset) {
+        printf("FAIL: out_unknowns_restored — abort did not restore keyset (got %04x expected %04x)\n",
+               psbt->outputs[0].mweb_output_keyset, expected_keyset);
+        ok = false;
+    }
+
+    wally_map_clear(&expected);
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+    wally_psbt_free(psbt);
+
+    if (ok) printf("PASS: output_unknowns_restored_after_abort\n");
+    else failures++;
+}
+
+static void test_output_unknowns_snapshot_empty_map(void)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 1, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: empty_map — wally_psbt_init_alloc\n");
+        failures++;
+        return;
+    }
+    psbt->num_outputs = 1;
+
+    /* output[0].unknowns is zero-initialised; mweb_output_keyset stays 0
+     * so verify_mweb_output is skipped. */
+    psbt->outputs[0].has_amount = 1;
+    psbt->outputs[0].amount = 0;
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    prep_valid_fee_only(&kernel);
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0;
+
+    seed_trng_nonzero(0x42);
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    bool ok = true;
+    if (err != MWEB_OK || !s) {
+        printf("FAIL: empty_map — begin returned %d\n", err);
+        ok = false;
+    }
+
+    /* Mutate the previously-empty live map. */
+    if (ok) {
+        const uint8_t k = 0x96;
+        const uint8_t v[3] = { 'n','e','w' };
+        if (wally_map_add(&psbt->outputs[0].unknowns, &k, 1, v, sizeof(v)) != WALLY_OK) {
+            printf("FAIL: empty_map — wally_map_add\n");
+            ok = false;
+        }
+        psbt->outputs[0].mweb_output_keyset |= TEST_MWEB_OUT_BIT(0x96);
+    }
+
+    mweb_session_abort(s, psbt);
+    s = NULL;
+
+    if (ok && psbt->outputs[0].unknowns.num_items != 0) {
+        printf("FAIL: empty_map — abort did not empty unknowns (num_items=%zu)\n",
+               psbt->outputs[0].unknowns.num_items);
+        ok = false;
+    }
+    if (ok && psbt->outputs[0].mweb_output_keyset != 0) {
+        printf("FAIL: empty_map — abort did not zero keyset (got %04x)\n",
+               psbt->outputs[0].mweb_output_keyset);
+        ok = false;
+    }
+
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+    wally_psbt_free(psbt);
+
+    if (ok) printf("PASS: output_unknowns_snapshot_empty_map\n");
+    else failures++;
+}
+
+/*
+ * Multi-output independence: two outputs each carry distinct unknowns
+ * + keysets at begin; abort must restore each slot to its own
+ * begin-entry state without crosstalk.
+ */
+static void test_output_unknowns_multi_output_independence(void)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 2, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: multi_out — wally_psbt_init_alloc\n");
+        failures++;
+        return;
+    }
+    psbt->num_outputs = 2;
+
+    /* Output 0: one entry at 0x92, FEATURES keyset bit. */
+    if (wally_map_init(1, NULL, &psbt->outputs[0].unknowns) != WALLY_OK) {
+        printf("FAIL: multi_out — wally_map_init[0]\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    const uint8_t k0 = 0x92;
+    const uint8_t v0[4] = { 'z','e','r','o' };
+    if (wally_map_add(&psbt->outputs[0].unknowns, &k0, 1, v0, sizeof(v0)) != WALLY_OK) {
+        printf("FAIL: multi_out — wally_map_add[0]\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    const uint16_t ks0 = TEST_MWEB_OUT_BIT(0x92);
+    psbt->outputs[0].mweb_output_keyset = ks0;
+    psbt->outputs[0].has_amount = 1;
+
+    /* Output 1: two entries at 0x98 and 0x9A, EXTRA_DATA keyset bit. */
+    if (wally_map_init(2, NULL, &psbt->outputs[1].unknowns) != WALLY_OK) {
+        printf("FAIL: multi_out — wally_map_init[1]\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    const uint8_t k1a = 0x98, k1b = 0x9A;
+    const uint8_t v1a[3] = { 'o','n','e' };
+    const uint8_t v1b[5] = { 't','h','r','e','e' };
+    if (wally_map_add(&psbt->outputs[1].unknowns, &k1a, 1, v1a, sizeof(v1a)) != WALLY_OK
+        || wally_map_add(&psbt->outputs[1].unknowns, &k1b, 1, v1b, sizeof(v1b)) != WALLY_OK) {
+        printf("FAIL: multi_out — wally_map_add[1]\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    const uint16_t ks1 = TEST_MWEB_OUT_BIT(0x98);
+    psbt->outputs[1].mweb_output_keyset = ks1;
+    psbt->outputs[1].has_amount = 1;
+
+    /* Clone each begin-entry state. */
+    struct wally_map exp0, exp1;
+    memset(&exp0, 0, sizeof(exp0));
+    memset(&exp1, 0, sizeof(exp1));
+    if (wally_map_init(1, NULL, &exp0) != WALLY_OK
+        || wally_map_combine(&exp0, &psbt->outputs[0].unknowns) != WALLY_OK
+        || wally_map_init(2, NULL, &exp1) != WALLY_OK
+        || wally_map_combine(&exp1, &psbt->outputs[1].unknowns) != WALLY_OK) {
+        printf("FAIL: multi_out — clone expected\n");
+        failures++;
+        wally_map_clear(&exp0);
+        wally_map_clear(&exp1);
+        wally_psbt_free(psbt);
+        return;
+    }
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    prep_valid_fee_only(&kernel);
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0;
+
+    seed_trng_nonzero(0x42);
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    bool ok = true;
+    if (err != MWEB_OK || !s) {
+        printf("FAIL: multi_out — begin returned %d\n", err);
+        ok = false;
+    }
+
+    /* Mutate both slots distinctly between begin and abort. */
+    if (ok) {
+        const uint8_t k_new0 = 0x96;
+        const uint8_t v_new0[3] = { 'A','A','A' };
+        if (wally_map_add(&psbt->outputs[0].unknowns, &k_new0, 1, v_new0, sizeof(v_new0))
+                != WALLY_OK) { ok = false; }
+        psbt->outputs[0].mweb_output_keyset |= TEST_MWEB_OUT_BIT(0x96);
+
+        const uint8_t k_new1 = 0x97;
+        const uint8_t v_new1[2] = { 'B','B' };
+        if (ok && wally_map_add(&psbt->outputs[1].unknowns, &k_new1, 1, v_new1, sizeof(v_new1))
+                != WALLY_OK) { ok = false; }
+        psbt->outputs[1].mweb_output_keyset |= TEST_MWEB_OUT_BIT(0x97);
+
+        if (!ok) printf("FAIL: multi_out — wally_map_add on live\n");
+    }
+
+    mweb_session_abort(s, psbt);
+    s = NULL;
+
+    if (ok && (!wally_maps_byte_equal(&psbt->outputs[0].unknowns, &exp0)
+               || psbt->outputs[0].mweb_output_keyset != ks0)) {
+        printf("FAIL: multi_out — output[0] not restored\n");
+        ok = false;
+    }
+    if (ok && (!wally_maps_byte_equal(&psbt->outputs[1].unknowns, &exp1)
+               || psbt->outputs[1].mweb_output_keyset != ks1)) {
+        printf("FAIL: multi_out — output[1] not restored\n");
+        ok = false;
+    }
+
+    wally_map_clear(&exp0);
+    wally_map_clear(&exp1);
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+    wally_psbt_free(psbt);
+
+    if (ok) printf("PASS: output_unknowns_multi_output_independence\n");
+    else failures++;
+}
+
+/*
+ * Integer-key round-trip via `wally_map_replace_integer`. Integer-keyed
+ * items have a structurally different on-disk shape from byte-keyed
+ * items (`item.key == NULL`, `item.key_len` holds the integer value),
+ * so this test exercises the clone+swap path against that shape — the
+ * byte-key shape `wally_map_add` produces is covered separately above.
+ */
+static void test_output_unknowns_integer_keys_restored_after_abort(void)
+{
+    struct wally_psbt *psbt = NULL;
+    if (wally_psbt_init_alloc(2, 0, 1, 0, 0, &psbt) != WALLY_OK || !psbt) {
+        printf("FAIL: int_keys_restored — wally_psbt_init_alloc\n");
+        failures++;
+        return;
+    }
+    psbt->num_outputs = 1;
+
+    if (wally_map_init(2, NULL, &psbt->outputs[0].unknowns) != WALLY_OK) {
+        printf("FAIL: int_keys_restored — wally_map_init\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    /* Seed with two integer-keyed entries that the host might leave on
+     * an unsigned PSBT (0x92 features, 0x98 extra_data). Keys outside
+     * the STEALTH_ADDRESS / COMMIT pair so verify_mweb_output is
+     * skipped. */
+    const uint8_t v_features[1] = { 0x01 };
+    const uint8_t v_extra[6]    = { 'm','e','m','o','=','1' };
+    if (wally_map_replace_integer(&psbt->outputs[0].unknowns, 0x92,
+                                   v_features, sizeof(v_features)) != WALLY_OK
+        || wally_map_replace_integer(&psbt->outputs[0].unknowns, 0x98,
+                                      v_extra, sizeof(v_extra)) != WALLY_OK) {
+        printf("FAIL: int_keys_restored — wally_map_replace_integer (seed)\n");
+        failures++;
+        wally_psbt_free(psbt);
+        return;
+    }
+    const uint16_t expected_keyset = TEST_MWEB_OUT_BIT(0x92) | TEST_MWEB_OUT_BIT(0x98);
+    psbt->outputs[0].mweb_output_keyset = expected_keyset;
+    psbt->outputs[0].has_amount = 1;
+    psbt->outputs[0].amount = 0;
+
+    struct wally_map expected;
+    memset(&expected, 0, sizeof(expected));
+    if (wally_map_init(2, NULL, &expected) != WALLY_OK
+        || wally_map_combine(&expected, &psbt->outputs[0].unknowns) != WALLY_OK) {
+        printf("FAIL: int_keys_restored — clone expected\n");
+        failures++;
+        wally_map_clear(&expected);
+        wally_psbt_free(psbt);
+        return;
+    }
+
+    struct wally_psbt_kernel kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    prep_valid_fee_only(&kernel);
+    psbt->mweb_kernels = &kernel;
+    psbt->num_mweb_kernels = 1;
+    psbt->mweb_kernels_allocation_len = 0;
+
+    seed_trng_nonzero(0x42);
+    mweb_session_t *s = NULL;
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+
+    bool ok = true;
+    if (err != MWEB_OK || !s) {
+        printf("FAIL: int_keys_restored — begin returned %d\n", err);
+        ok = false;
+    }
+
+    /* Replace three integer-keyed entries and OR new bits into the
+     * keyset. */
+    if (ok) {
+        const uint8_t v_commit[33]    = { 0x08, 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+                                           17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32 };
+        const uint8_t v_pubkey[33]    = { 0x02, 32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,
+                                           16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1 };
+        const uint8_t v_signature[64] = { [0 ... 63] = 0xCC };
+        if (wally_map_replace_integer(&psbt->outputs[0].unknowns, 0x91,
+                                       v_commit, sizeof(v_commit)) != WALLY_OK
+            || wally_map_replace_integer(&psbt->outputs[0].unknowns, 0x94,
+                                          v_pubkey, sizeof(v_pubkey)) != WALLY_OK
+            || wally_map_replace_integer(&psbt->outputs[0].unknowns, 0x97,
+                                          v_signature, sizeof(v_signature)) != WALLY_OK) {
+            printf("FAIL: int_keys_restored — wally_map_replace_integer (mutate)\n");
+            ok = false;
+        }
+        psbt->outputs[0].mweb_output_keyset
+            |= TEST_MWEB_OUT_BIT(0x91)
+             | TEST_MWEB_OUT_BIT(0x94)
+             | TEST_MWEB_OUT_BIT(0x97);
+    }
+
+    /* Sanity: pre-abort mutation is observable. */
+    if (ok && wally_maps_byte_equal(&psbt->outputs[0].unknowns, &expected)) {
+        printf("FAIL: int_keys_restored — mutation invisible (test bug)\n");
+        ok = false;
+    }
+
+    mweb_session_abort(s, psbt);
+    s = NULL;
+
+    if (ok && !wally_maps_byte_equal(&psbt->outputs[0].unknowns, &expected)) {
+        printf("FAIL: int_keys_restored — abort did not restore integer-keyed unknowns\n");
+        ok = false;
+    }
+    if (ok && psbt->outputs[0].mweb_output_keyset != expected_keyset) {
+        printf("FAIL: int_keys_restored — abort did not restore keyset (got %04x expected %04x)\n",
+               psbt->outputs[0].mweb_output_keyset, expected_keyset);
+        ok = false;
+    }
+    /* Cross-check the post-abort items are integer-keyed (key == NULL)
+     * to prove the clone preserved the libwally integer-key encoding,
+     * not just byte-converted them. */
+    if (ok) {
+        for (size_t i = 0; i < psbt->outputs[0].unknowns.num_items; i++) {
+            if (psbt->outputs[0].unknowns.items[i].key != NULL) {
+                printf("FAIL: int_keys_restored — item %zu key not NULL (clone lost integer-key shape)\n", i);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    wally_map_clear(&expected);
+    psbt->mweb_kernels = NULL;
+    psbt->num_mweb_kernels = 0;
+    wally_map_clear(&kernel.pegouts);
+    wally_map_clear(&kernel.unknowns);
+    wally_psbt_free(psbt);
+
+    if (ok) printf("PASS: output_unknowns_integer_keys_restored_after_abort\n");
+    else failures++;
+}
+
 int test_mweb_atomic_sign(void)
 {
     failures = 0;
@@ -2008,8 +2503,12 @@ int test_mweb_atomic_sign(void)
     test_mweb_output_s2_binding_ok();
     test_mweb_output_s2_tampered_commit_rejects();
     test_has_mweb_gate_shapes();
+    test_output_unknowns_restored_after_abort();
+    test_output_unknowns_snapshot_empty_map();
+    test_output_unknowns_multi_output_independence();
+    test_output_unknowns_integer_keys_restored_after_abort();
 
-    printf("\nmweb_atomic_sign: 23 tests, %d failures\n", failures);
+    printf("\nmweb_atomic_sign: 27 tests, %d failures\n", failures);
     return failures;
 }
 
