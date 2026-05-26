@@ -157,6 +157,12 @@ run_one test_mweb_rangeproof \
     /Jade/main/mweb/mweb_scalar.c /Jade/main/mweb/mweb_blind.c \
     /Jade/main/mweb/mweb_hash.c /Jade/main/mweb/mweb_schnorr.c
 
+run_one test_mweb_sign_output \
+    /Jade/main/mweb/tests/test_mweb_sign_output.c \
+    /Jade/main/mweb/mweb_schnorr.c /Jade/main/mweb/mweb_kernel.c \
+    /Jade/main/mweb/mweb_scalar.c /Jade/main/mweb/mweb_blind.c \
+    /Jade/main/mweb/mweb_hash.c
+
 run_one test_mweb_atomic_sign \
     /Jade/main/mweb/tests/test_mweb_atomic_sign.c \
     /Jade/main/mweb/mweb_atomic_sign.c /Jade/main/mweb/mweb_sign.c \

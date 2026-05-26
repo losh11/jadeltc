@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include <blake3.h>
 #include <mbedtls/bignum.h>
 #include <mbedtls/sha256.h>
 
@@ -199,6 +200,13 @@ bool mweb_schnorr_sign(const uint8_t secret_key[32],
     ok = true;
 
 cleanup:
+    /* If the call failed after R.x was written at line ~155 but before s
+     * was written, signature[0..32] would otherwise hold R.x while
+     * signature[32..64] is uninitialized stomp. Wipe so callers that
+     * misuse the buffer despite ok=false see all-zero. */
+    if (!ok) {
+        wally_bzero(signature, 64);
+    }
     wally_bzero(k, sizeof(k));
     wally_bzero(e, sizeof(e));
     wally_bzero(s, sizeof(s));
@@ -207,4 +215,39 @@ cleanup:
     wally_bzero(&R_pk, sizeof(R_pk));
     wally_bzero(&sk_pk, sizeof(sk_pk));
     return ok;
+}
+
+mweb_err_t mweb_sign_output(
+    const uint8_t sender_key[32],
+    const uint8_t commit[33],
+    const uint8_t K_s[33],
+    const uint8_t K_o[33],
+    const uint8_t msg_hash[32],
+    const uint8_t rp_hash[32],
+    uint8_t sig_out[64])
+{
+    if (!sender_key || !commit || !K_s || !K_o
+        || !msg_hash || !rp_hash || !sig_out) {
+        return MWEB_ERR_INTERNAL;
+    }
+    if (!mweb_validate_scalar(sender_key)) {
+        return MWEB_ERR_INVALID_PRESIGN_SCALAR;
+    }
+
+    uint8_t sig_hash[32];
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(&hasher, commit,   33);
+    blake3_hasher_update(&hasher, K_s,      33);
+    blake3_hasher_update(&hasher, K_o,      33);
+    blake3_hasher_update(&hasher, msg_hash, 32);
+    blake3_hasher_update(&hasher, rp_hash,  32);
+    blake3_hasher_finalize(&hasher, sig_hash, 32);
+
+    mweb_err_t err = MWEB_OK;
+    if (!mweb_schnorr_sign(sender_key, sig_hash, 32, sig_out)) {
+        err = MWEB_ERR_INTERNAL;
+    }
+    wally_bzero(sig_hash, sizeof(sig_hash));
+    return err;
 }
