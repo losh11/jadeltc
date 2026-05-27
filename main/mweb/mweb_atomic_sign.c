@@ -998,6 +998,8 @@ static mweb_err_t build_mweb_output(const struct wally_psbt_output *po,
 mweb_err_t mweb_session_begin(
     struct wally_psbt *psbt,
     uint8_t network_id,
+    mweb_build_progress_cb progress_cb,
+    void *progress_ctx,
     mweb_session_t **out_session)
 {
     if (out_session) {
@@ -1243,6 +1245,15 @@ mweb_err_t mweb_session_begin(
         const struct wally_psbt_output *po = &psbt->outputs[i];
         if (!MWEB_OUT_IS_MWEB(po->mweb_output_keyset)) {
             continue;
+        }
+
+        /* Fire the progress callback before the heavy bulletproof
+         * generation begins so the UI text reflects what is *currently*
+         * being computed. s->n_outputs is the count of previously-
+         * built MWEB outputs (bumped only after a successful build), so
+         * s->n_outputs + 1 is the 1-indexed position about to be built. */
+        if (progress_cb) {
+            progress_cb(s->n_outputs + 1, n_mweb_outputs, progress_ctx);
         }
 
         /* Build directly into the heap-allocated session slot to avoid

@@ -1485,7 +1485,7 @@ static bool test_mweb_session_null_guards(void)
 
     /* begin with NULL psbt surfaces INTERNAL and must clear *out_session. */
     mweb_session_t *s = (void *)0xdeadbeef;
-    if (mweb_session_begin(NULL, (uint8_t)NETWORK_LITECOIN, &s)
+    if (mweb_session_begin(NULL, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s)
             != MWEB_ERR_INTERNAL) { FAIL(); }
     if (s != NULL) { FAIL(); }
 
@@ -1532,7 +1532,7 @@ static void prep_feezero_only(struct wally_psbt_kernel *k)
 static bool run_standard_to_mweb_ok(struct wally_psbt *psbt, struct wally_psbt_kernel *k)
 {
     mweb_session_t *s = NULL;
-    if (mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s) != MWEB_OK
+    if (mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s) != MWEB_OK
         || !s) { return false; }
     if (mweb_session_commit(s, psbt) != MWEB_OK) { return false; }
     if (!k->has_excess_commitment || !k->has_signature) { return false; }
@@ -1613,7 +1613,7 @@ static bool run_rollback_on_reject(struct wally_psbt *psbt, struct wally_psbt_ke
     snapshot_session_state(psbt, k, &pre);
 
     mweb_session_t *s = NULL;
-    const mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    const mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     snapshot_session_state(psbt, k, &post);
 
@@ -1665,7 +1665,7 @@ static bool run_pegout_skipped(struct wally_psbt *psbt, struct wally_psbt_kernel
     snapshot_session_state(psbt, k, &pre);
 
     mweb_session_t *s = NULL;
-    if (mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s) != MWEB_OK
+    if (mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s) != MWEB_OK
         || !s) { return false; }
     if (mweb_session_pegout_count(s) != 1) { return false; }
     /* Commit without mark → reject + rollback. */
@@ -1684,7 +1684,7 @@ static bool test_mweb_session_pegout_skipped_rejects(void)
 static bool run_pegout_marked_ok(struct wally_psbt *psbt, struct wally_psbt_kernel *k)
 {
     mweb_session_t *s = NULL;
-    if (mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s) != MWEB_OK
+    if (mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s) != MWEB_OK
         || !s) { return false; }
     mweb_session_mark_pegout_confirmed(s, 0);
     if (mweb_session_commit(s, psbt) != MWEB_OK) { return false; }

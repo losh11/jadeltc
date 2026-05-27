@@ -246,7 +246,7 @@ static void test_begin_rejects_bad_inputs(void)
     mweb_session_t* s = (void*)0xdeadbeef;
 
     /* NULL psbt → MWEB_ERR_INTERNAL, out_session must be cleared. */
-    if (mweb_session_begin(NULL, 0, &s) != MWEB_ERR_INTERNAL) {
+    if (mweb_session_begin(NULL, 0, NULL, NULL, &s) != MWEB_ERR_INTERNAL) {
         printf("FAIL: begin_bad_inputs — NULL psbt\n");
         failures++;
         return;
@@ -260,7 +260,7 @@ static void test_begin_rejects_bad_inputs(void)
     /* NULL out_session → MWEB_ERR_INTERNAL. */
     struct wally_psbt dummy;
     memset(&dummy, 0, sizeof(dummy));
-    if (mweb_session_begin(&dummy, 0, NULL) != MWEB_ERR_INTERNAL) {
+    if (mweb_session_begin(&dummy, 0, NULL, NULL, NULL) != MWEB_ERR_INTERNAL) {
         printf("FAIL: begin_bad_inputs — NULL out_session\n");
         failures++;
         return;
@@ -280,7 +280,7 @@ static void test_begin_rejects_missing_kernel(void)
     }
 
     mweb_session_t* s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
     if (err != MWEB_ERR_MISSING_KERNEL) {
         printf("FAIL: missing_kernel — expected %d got %d\n",
             MWEB_ERR_MISSING_KERNEL, err);
@@ -319,7 +319,7 @@ static void test_begin_rejects_multi_kernel(void)
     /* mweb_kernels stays NULL; psbt_kernels_free's if-guard handles it. */
 
     mweb_session_t* s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
     if (err != MWEB_ERR_MULTI_KERNEL_UNSUPPORTED) {
         printf("FAIL: multi_kernel — expected %d got %d\n",
             MWEB_ERR_MULTI_KERNEL_UNSUPPORTED, err);
@@ -361,7 +361,7 @@ static void test_begin_rejects_non_litecoin(void)
     };
     for (size_t i = 0; i < sizeof(foreign) / sizeof(foreign[0]); ++i) {
         mweb_session_t* s = NULL;
-        mweb_err_t err = mweb_session_begin(psbt, (uint8_t)foreign[i], &s);
+        mweb_err_t err = mweb_session_begin(psbt, (uint8_t)foreign[i], NULL, NULL, &s);
         if (err != MWEB_ERR_UNSUPPORTED_NETWORK) {
             printf("FAIL: non_litecoin — network %u got %d\n",
                 (unsigned)foreign[i], err);
@@ -385,7 +385,7 @@ static void test_begin_rejects_non_litecoin(void)
      * network-specific rather than a blanket reject. */
     psbt->num_mweb_kernels = 2;
     mweb_session_t* s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
     if (err != MWEB_ERR_MULTI_KERNEL_UNSUPPORTED) {
         printf("FAIL: non_litecoin — litecoin should proceed past net check, got %d\n", err);
         failures++;
@@ -461,7 +461,7 @@ static void run_kernel_reject_case(const char *tag,
     psbt->mweb_kernels_allocation_len = 0; /* We own the buffer, libwally must not free it. */
 
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     /* Tear the borrowed kernel out of the PSBT before libwally frees it. */
     psbt->mweb_kernels = NULL;
@@ -744,7 +744,7 @@ static void test_standard_to_mweb_session_commit_ok(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK) {
@@ -849,7 +849,7 @@ static void test_rollback_byte_equal_on_reject(void)
     snapshot_psbt_mweb(psbt, &kernel, &pre);
 
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     psbt_mweb_snapshot_t post;
     snapshot_psbt_mweb(psbt, &kernel, &post);
@@ -907,7 +907,7 @@ static void test_pegout_flow_skipped_rejects_and_rolls_back(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -993,7 +993,7 @@ static void test_pegout_flow_marked_commits_ok(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -1075,7 +1075,7 @@ static void test_shared_secret_bypass_rejected(void)
     psbt->mweb_kernels_allocation_len = 0;
 
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = (err == MWEB_ERR_FOREIGN_MWEB_INPUT) && (s == NULL);
     if (!ok) {
@@ -1426,7 +1426,7 @@ static void test_owned_input_sign_ok(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -1533,7 +1533,7 @@ static void test_input_commit_mismatch_rejects(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = (err == MWEB_ERR_INPUT_COMMIT_MISMATCH) && (s == NULL);
     if (!ok) {
@@ -1587,7 +1587,7 @@ static void test_input_commit_missing_rejects(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = (err == MWEB_ERR_INPUT_COMMIT_MISMATCH) && (s == NULL);
     if (!ok) {
@@ -1650,7 +1650,7 @@ static void test_input_commit_not_rewritten(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -1762,7 +1762,7 @@ static void test_mweb_output_build_and_commit_ok(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -1891,7 +1891,7 @@ static void test_mweb_output_build_abort_restores_psbt(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -1983,7 +1983,7 @@ static void test_mweb_output_build_ignores_host_offsets(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -2225,7 +2225,7 @@ static void test_output_unknowns_restored_after_abort(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -2306,7 +2306,7 @@ static void test_output_unknowns_snapshot_empty_map(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -2429,7 +2429,7 @@ static void test_output_unknowns_multi_output_independence(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -2543,7 +2543,7 @@ static void test_output_unknowns_integer_keys_restored_after_abort(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK || !s) {
@@ -2650,7 +2650,7 @@ static void test_kernel_stealth_excess_session_commit_ok(void)
 
     seed_trng_nonzero(0x42);
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_OK) {
@@ -2746,7 +2746,7 @@ static void test_kernel_stealth_excess_trng_exhausts_to_internal(void)
     memset(g_test_random, 0, sizeof(g_test_random));
 
     mweb_session_t *s = NULL;
-    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, &s);
+    mweb_err_t err = mweb_session_begin(psbt, (uint8_t)NETWORK_LITECOIN, NULL, NULL, &s);
 
     bool ok = true;
     if (err != MWEB_ERR_INTERNAL) {

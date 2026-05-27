@@ -22,7 +22,8 @@
  *
  *   mweb_session_t *s = NULL;
  *   if (has_mweb) {
- *       mweb_err_t err = mweb_session_begin(psbt, network_id, &s);
+ *       mweb_err_t err = mweb_session_begin(
+ *           psbt, network_id, progress_cb, progress_ctx, &s);
  *       if (err != MWEB_OK) { handle; goto cleanup; }
  *       // Outputs verified, balance + kernel sig produced into s,
  *       // PSBT still unmodified.
@@ -55,9 +56,27 @@
 typedef struct mweb_session mweb_session_t;
 
 /*
+ * Optional progress callback fired by mweb_session_begin() once per
+ * MWEB output, immediately before that output is built. The argument
+ * `i` is the 1-indexed position of the output about to be built and
+ * `n` is the total number of MWEB outputs in the PSBT. `ctx` is the
+ * opaque pointer the caller registered.
+ *
+ * The bulletproof rangeproof inside mweb_build_output() dominates the
+ * wall-clock cost (~5 s/output on ESP32-S3), so per-output granularity
+ * is sufficient to keep the screen from looking frozen on a multi-
+ * output PSBT. The callback runs on the signing task; it must not call
+ * back into the session, free it, or mutate the PSBT.
+ */
+typedef void (*mweb_build_progress_cb)(size_t i, size_t n, void *ctx);
+
+/*
  * Derive input states, verify every MWEB output's recipient binding,
  * check input commits, validate the u64 balance, and sign the kernel
  * into session memory. PSBT is NOT mutated by this call.
+ *
+ * `progress_cb` may be NULL; when non-NULL it is invoked before each
+ * mweb_build_output() call with `progress_ctx` passed through.
  *
  * On success *out_session receives a heap allocation. On failure
  * *out_session is NULL.
@@ -65,6 +84,8 @@ typedef struct mweb_session mweb_session_t;
 mweb_err_t mweb_session_begin(
     struct wally_psbt *psbt,
     uint8_t network_id,
+    mweb_build_progress_cb progress_cb,
+    void *progress_ctx,
     mweb_session_t **out_session);
 
 /*

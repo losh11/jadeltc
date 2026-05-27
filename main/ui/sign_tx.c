@@ -867,4 +867,45 @@ bool show_mweb_pegin_activity(const uint64_t amount, const network_t network)
     return show_input_output_activity(
         "MWEB Pegin", false, false, "Transparent -> MWEB", amount_str, network_ticker(network), NULL, NULL, NULL);
 }
+
+// Build the MWEB output-build progress screen: one centred text line
+// the caller updates between iterations via gui_update_text. The text
+// node is returned so subsequent updates skip the activity rebuild.
+static gui_activity_t* make_mweb_build_progress_activity(
+    const char* initial_line, gui_view_node_t** text_node_out)
+{
+    JADE_ASSERT(initial_line);
+    JADE_ASSERT(text_node_out);
+
+    gui_activity_t* const act = gui_make_activity();
+
+    gui_view_node_t* node;
+    gui_make_text(&node, initial_line, TFT_WHITE);
+    gui_set_align(node, GUI_ALIGN_CENTER, GUI_ALIGN_MIDDLE);
+    gui_set_padding(node, GUI_MARGIN_ALL_DIFFERENT, 0, 2, 0, 2);
+    gui_set_parent(node, act->root_node);
+
+    *text_node_out = node;
+    return act;
+}
+
+void mweb_session_progress_cb(const size_t current, const size_t total, void* const ctx)
+{
+    JADE_ASSERT(ctx);
+    JADE_ASSERT(current >= 1);
+    JADE_ASSERT(current <= total);
+    mweb_build_progress_state_t* const state = (mweb_build_progress_state_t*)ctx;
+
+    char line[48];
+    const int ret = snprintf(line, sizeof(line),
+        "Building MWEB output %u/%u", (unsigned)current, (unsigned)total);
+    JADE_ASSERT(ret > 0 && ret < sizeof(line));
+
+    if (!state->text_node) {
+        gui_activity_t* const act = make_mweb_build_progress_activity(line, &state->text_node);
+        gui_set_current_activity(act);
+    } else {
+        gui_update_text(state->text_node, line);
+    }
+}
 #endif // AMALGAMATED_BUILD

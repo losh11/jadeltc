@@ -31,4 +31,20 @@ bool show_mweb_address_activity(const char* address, network_t network);
 bool show_mweb_output_activity(const char* title, const char* address, const char* amount, network_t network);
 bool show_mweb_pegin_activity(uint64_t amount, network_t network);
 
+// Progress state for the MWEB output-build screen. The text node is
+// NULL on initial declaration; the first call to
+// mweb_session_progress_cb() lazily creates and shows the activity,
+// then stashes the text node here so subsequent calls update the
+// existing screen instead of re-creating it.
+typedef struct {
+    gui_view_node_t* text_node;
+} mweb_build_progress_state_t;
+
+// Progress callback compatible with mweb_build_progress_cb (declared
+// in mweb_atomic_sign.h). Renders "Building MWEB output i/n" and
+// updates the screen so the device does not appear frozen during the
+// ~5s/output bulletproof generation. `ctx` MUST point to a
+// mweb_build_progress_state_t.
+void mweb_session_progress_cb(size_t current, size_t total, void* ctx);
+
 #endif /* UI_SIGN_TX_H_ */

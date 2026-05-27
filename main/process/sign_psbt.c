@@ -1210,9 +1210,17 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
         // The gate fires on any MWEB component so a standard→MWEB send
         // (zero MWEB inputs, one MWEB output, one kernel) still enters
         // the bind-then-sign pass.
+        //
+        // The progress callback drives a "Building MWEB output i/N"
+        // screen so bulletproof generation (~5 s/output) does not look
+        // like a frozen device on multi-output sends.
         {
             if (sign_psbt_has_mweb_component(psbt)) {
-                mweb_err_t merr = mweb_session_begin(psbt, network_id, &mweb_session);
+                mweb_build_progress_state_t progress_state = { 0 };
+                mweb_err_t merr = mweb_session_begin(
+                    psbt, network_id,
+                    mweb_session_progress_cb, &progress_state,
+                    &mweb_session);
                 if (merr != MWEB_OK) {
                     *errmsg = mweb_err_to_string(merr);
                     retval = (merr == MWEB_ERR_USER_CANCEL)
